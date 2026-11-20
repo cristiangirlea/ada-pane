@@ -12,7 +12,46 @@ export type Stats = {
   exercise: { kind: string; answered: boolean } | null
 }
 
-export type AdaView = 'now' | 'progress' | 'badges'
+export type AdaView = 'session' | 'repo' | 'you'
+
+/** One finished tool call, as the strip draws it. */
+export type ToolBar = { tool: string; ms: number; ok: boolean }
+
+/** The last test run seen: the runner's name only, never its command. */
+export type TestRun = { runner: string; ok: boolean; at: number }
+
+/** What `git status --porcelain=v2 --branch` says of the working tree. */
+export type GitStatus = {
+  /** The branch, or `detached at <short commit>`. */
+  head: string
+  detached: boolean
+  changed: number
+  /** Null when the branch has no upstream. */
+  ahead: number | null
+  behind: number | null
+}
+
+export type CheckState = 'passed' | 'failed' | 'running'
+
+/** What `gh pr view --json ...` says of the branch's pull request. */
+export type PullRequest = {
+  number: number
+  title: string
+  state: 'open' | 'merged' | 'closed'
+  review: 'approved' | 'changes' | 'required' | 'none'
+  checks: CheckState[]
+  /** Issues it closes in this repository. */
+  issues: number[]
+}
+
+export type PrReading =
+  | { kind: 'unknown' }
+  | { kind: 'none' }
+  | { kind: 'found'; pr: PullRequest }
+  /** gh is missing or not signed in: one dim line saying which. */
+  | { kind: 'note'; note: string }
+  /** Any other failure: the section is left out. */
+  | { kind: 'hidden' }
 
 export type AdaState = {
   stats: Stats | null
@@ -22,14 +61,29 @@ export type AdaState = {
   statsNote: string
   refreshing: boolean
   view: AdaView
-  prompts: number
-  started: number
-  finished: number
-  lastTool: string
-  lastStatus: string
   reaction: string
   mood: 'idle' | 'busy' | 'glad' | 'worried'
   recordingFailed: boolean
+  lastTool: string
+  lastToolAt: number
+  lastStatus: '' | 'running' | 'ok' | 'error'
+  /** Tool calls started and not finished. */
+  running: number
+  /** The last 40 finished calls, oldest first. */
+  calls: ToolBar[]
+  callCount: number
+  failedCount: number
+  slowest: ToolBar | null
+  /** When the running turn started; 0 between turns. */
+  turnStartedAt: number
+  turnCalls: number
+  /** Moved once a second while a turn runs, so the running time redraws. */
+  tick: number
+  lastTurn: { ms: number; calls: number } | null
+  tests: TestRun | null
+  editedSinceTests: boolean
+  git: GitStatus | null
+  pr: PrReading
 }
 
 declare module 'claude-code' {

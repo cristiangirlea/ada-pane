@@ -1,7 +1,9 @@
 # ada-pane
 
-Ada's side pane for Claude Code. It opens at session start and on `/ada`, shows `hrn bot stats`
-(refreshed every minute), counts prompts and tool calls, and reacts to each one.
+Ada's side pane for Claude Code. It opens at session start and on `/ada`, with three views:
+Session (context, plan limit, turn time, a strip of tool calls, the working tree and one
+suggested action), Repo (the branch, its pull request and checks through `gh`, links) and You
+(`hrn bot stats`). The layout is specified in [docs/pane-design.md](docs/pane-design.md).
 
 It records event metadata only (time, session, kind, tool name, ok or error; never prompt or
 command text) to `~/.hrn/claude-sessions/<session>.jsonl` (or under `HRN_HOME`), rotating files

@@ -2,7 +2,7 @@
 
 Status: built. Slices 1, 2 and 4 are in this repository; slice 3 is two hrn additions in
 harness (issues 966 and 967), and the Repo view's hrn sections appear once an hrn built with
-them is installed. `Watch` is not built (see Links). This replaces the first redesign's layout (bordered cards, three views) and adds session,
+them is installed. This replaces the first redesign's layout (bordered cards, three views) and adds session,
 repository and delivery readings.
 
 ## Why
@@ -88,9 +88,11 @@ Three buttons: `Session`, `Repo`, `You`; the current one `primary`. The choice i
    - Running now: one line each, backend and how long, at most three.
    - Last five finished: a dot for the result, backend, duration, how long ago.
 4. **Links**, one row: `Repository`, `Pull requests`, `Actions`, and `Watch` (hrn watch's
-   page, when it is running, not on a remote surface). `Watch` is not built: hrn records no
-   address of a running watch, and the port is the person's choice, so the pane cannot tell
-   whether or where one runs.
+   page, when it is running, not on a remote surface). hrn records no address of a running
+   watch, so the address is the mod's `watch_address` option (`127.0.0.1:8089`, hrn's default),
+   accepted only on this computer (`127.0.0.1`, `localhost`, `[::1]`). The pane asks it as `gh`
+   is asked, with a two-second limit, and shows the link, on the terminal only, when the page's
+   title ends in `· hrn watch`.
 5. **Top repositories this week**, last and small: the five with the most delivery XP, this
    one marked. This is the "across projects" reading; a project that groups several
    repositories is in "To decide".
@@ -118,7 +120,7 @@ Three buttons: `Session`, `Repo`, `You`; the current one `primary`. The choice i
 | Claimed issue | the pull request's closing issues; before one exists, none shown | state |
 | Delivery here, strip, counts, top repositories | hrn, per repository (see below) | `$.store`, with age |
 | Runs here | hrn, per repository (see below) | state; every 30 seconds while a run is live and the Repo view is on screen |
-| Links | built from `$.session.repo.remote`; only `https://github.com/` remotes get links | none |
+| Links | built from `$.session.repo.remote`; only `https://github.com/` remotes get links. `Watch`: the `watch_address` option, asked over loopback | the address that answered, state |
 | Game figures | `hrn bot stats --json` | `$.store`, with age |
 
 ### What hrn has to give first
@@ -142,9 +144,11 @@ hrn sections out, without an error.
 - Recording to `~/.hrn/claude-sessions` does not change: event metadata only.
 - New readings live in the session's state and are never written to a file. The test check
   looks at a command's first words to name the runner and keeps the runner's name only.
-- Links are built from the repository's own remote; nothing from a tool's output or a web
-  page becomes a link.
+- Links are built from the repository's own remote, and `Watch` from the person's own
+  loopback address; nothing from a tool's output or a web page becomes a link.
 - `gh` and `git` are called read-only, with fixed arguments.
+- The only address the pane fetches is the watch address on this computer; any other host in
+  the option is ignored.
 
 ## Cost
 
@@ -153,6 +157,8 @@ hrn sections out, without an error.
 - `gh pr view`: when the Repo view opens and after a turn ends while it is open, at most once
   in 2 minutes, 8 second limit. Never while another view is shown.
 - hrn's per-repository answers: as `gh`, plus runs every 30 seconds while a run is live.
+- The watch address: as `gh`, with a two-second limit, and only while a terminal shows the
+  pane in a repository with a GitHub remote.
 - No timer redraws the pane while idle. A running turn ticks once a second.
 - Any of these failing hides its section; the pane shows no error for it.
 

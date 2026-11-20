@@ -113,6 +113,8 @@ export type AdaState = {
   delivery: Delivery | null
   /** Null while unknown, or when hrn cannot list runs per repository. */
   runs: HrnRun[] | null
+  /** The address that answered as an hrn watch; its link is drawn on the terminal only, and only while it is still the configured one. */
+  watch?: string | null
 }
 
 declare module 'claude-code' {

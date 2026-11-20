@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import {
-  age, barHeights, deliveryStrip, isLive, kindLine, parseDelivery, parseRuns, weekStart, blockRuns, checkState, chooseAction, contextPercent, dayGrid, duration, githubRepo, levelSpan, macaw,
+  age, barHeights, deliveryStrip, isLive, kindLine, parseDelivery, parseRuns, watchPage, weekStart, blockRuns, checkState, chooseAction, contextPercent, dayGrid, duration, githubRepo, levelSpan, macaw,
   parseGitStatus, parsePullRequest, parseStats, percentText, planFigure, pushCall, readPullRequest, readPullRequestFailure,
   record, repoLinks, resetsIn, ring, stopwatch, strip, testRunner, tokenCount,
 } from './register'
@@ -68,6 +68,10 @@ type World = {
   store?: Record<string, unknown>
   /** Whether the pane is the one its surface shows (true when not given). */
   shown?: boolean
+  /** The surfaces the session draws on (only the terminal when not given). */
+  surfaces?: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
+  /** What the watch address answers; unset refuses the connection. */
+  page?: (url: string) => Promise<{ status: number; text: string }> | { status: number; text: string }
 }
 
 /** The engine beneath the plugin, with each outside program answered by the test. */
@@ -80,6 +84,14 @@ function world(on: On, w: World = {}) {
   const files = new Map<string, string>()
   const runs: { argv: string[]; cwd?: string; timeoutMs?: number }[] = []
   const filled: string[] = []
+  const fetched: string[] = []
+  on('session.surfaces', () => ({ value: w.surfaces ?? ['terminal'] }))
+  on('http.fetch', async (_, e) => {
+    fetched.push(e.url)
+    if (!w.page) throw new Error('connection refused')
+    const r = await w.page(e.url)
+    return { value: { status: r.status, ok: r.status === 200, headers: {}, text: r.text } }
+  })
   on('session.id', () => ({ value: 'session-1' }))
   on('session.usage', () => {
     if (w.usage === null) throw new Error('not known yet')
@@ -104,7 +116,7 @@ function world(on: On, w: World = {}) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
-  return { clock, files, runs, filled, store }
+  return { clock, files, runs, filled, store, fetched }
 }
 
 /** A prompt typed at the composer, as the engine hands it on. */
@@ -1084,6 +1096,140 @@ test('the week starts on Monday at midnight UTC, as hrn’s does', () => {
   expect(new Date(weekStart(Date.parse('2026-11-20T15:00:00Z'))).toISOString()).toBe('2026-11-16T00:00:00.000Z')
   expect(new Date(weekStart(Date.parse('2026-11-16T00:00:00Z'))).toISOString()).toBe('2026-11-16T00:00:00.000Z')
   expect(new Date(weekStart(Date.parse('2026-11-22T23:59:59Z'))).toISOString()).toBe('2026-11-16T00:00:00.000Z')
+})
+
+// ---- Watch ----
+
+const REPO_STATE = {
+  stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'repo', reaction: 'Ready when you are.', mood: 'idle',
+  recordingFailed: false, lastTool: '', lastToolAt: 0, lastStatus: '', running: 0, calls: [], callCount: 0, failedCount: 0,
+  slowest: null, turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null, tests: null, editedSinceTests: false,
+  git: null, pr: { kind: 'none' }, delivery: null, runs: null,
+}
+
+const WATCH_PAGE = '<!doctype html><title>Runs · hrn watch</title>'
+
+test('the watch address is a port on this computer, or nothing', () => {
+  expect(watchPage('127.0.0.1:8089')).toBe('http://127.0.0.1:8089/')
+  expect(watchPage(' localhost:8091 ')).toBe('http://localhost:8091/')
+  expect(watchPage('[::1]:9000')).toBe('http://[::1]:9000/')
+  for (const bad of ['example.com:8089', '192.168.0.5:8089', '127.0.0.1', '127.0.0.1:0', '127.0.0.1:70000', 'http://127.0.0.1:8089', '127.0.0.1:8089/x', 7, null]) {
+    expect([bad, watchPage(bad)]).toEqual([bad, null])
+  }
+})
+
+test('the watch link is drawn on the terminal only, while a watch answers', async ($, on) => {
+  const w = world(on, { now: 600_000_000, store: { view: 'repo' }, page: () => ({ status: 200, text: WATCH_PAGE }) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(w.fetched).toEqual(['http://127.0.0.1:8089/'])
+  const terminal = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await terminal.findAll({ type: 'Link' })).filter(l => l.props.label === 'Watch').map(l => l.props.href)).toEqual(['http://127.0.0.1:8089/'])
+  await terminal.unmount()
+  // A remote surface would draw a loopback link as plain words, so the words must be absent too.
+  const desktop = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await desktop.findAll({ type: 'Link' })).some(l => l.props.label === 'Watch')).toBe(false)
+  expect((await desktop.findAll({ text: /Watch/ })).length).toBe(0)
+  await desktop.unmount()
+})
+
+test('the watch address comes from the option', { options: { watch_address: 'localhost:8091' } }, async ($, on) => {
+  const w = world(on, { now: 610_000_000, store: { view: 'repo' }, page: () => ({ status: 200, text: WATCH_PAGE }) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(w.fetched).toEqual(['http://localhost:8091/'])
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await ui.findAll({ type: 'Link' })).filter(l => l.props.label === 'Watch').map(l => l.props.href)).toEqual(['http://localhost:8091/'])
+  await ui.unmount()
+})
+
+test('an option naming another host is never reached', { options: { watch_address: 'example.com:8089' } }, async ($, on) => {
+  const w = world(on, { now: 620_000_000, store: { view: 'repo' }, page: () => ({ status: 200, text: WATCH_PAGE }) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(w.fetched).toEqual([])
+})
+
+const NOT_WATCH: [string, World['page'] | undefined][] = [
+  ['nothing listens', undefined],
+  ['another server answers', () => ({ status: 200, text: '<title>Something else</title>' })],
+  ['the watch refuses', () => ({ status: 403, text: WATCH_PAGE })],
+]
+NOT_WATCH.forEach(([name, page], i) => test(`no watch link when ${name}`, async ($, on) => {
+  const w = world(on, { now: 630_000_000 + i * 1_000_000, store: { view: 'repo' }, page })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(w.fetched.length).toBe(1)
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await ui.findAll({ type: 'Link' })).some(l => l.props.label === 'Watch')).toBe(false)
+  await ui.unmount()
+}))
+
+test('a watch that never answers is given up on after two seconds', async ($, on) => {
+  let clock: { sleep: (ms: number) => Promise<void>; advance: (ms: number) => Promise<void> } | null = null
+  const w = world(on, { now: 660_000_000, store: { view: 'repo' }, page: async () => { await clock?.sleep(3_600_000); return { status: 200, text: WATCH_PAGE } } })
+  clock = w.clock
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  await w.clock.advance(2000)
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await ui.findAll({ type: 'Link' })).some(l => l.props.label === 'Watch')).toBe(false)
+  await ui.unmount()
+  // The hung reading let go of the watch, so the next one after the two-minute wait still asks.
+  await w.clock.advance(121000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.fetched.length).toBe(2)
+  await w.clock.advance(3_600_000)
+})
+
+const NO_LINK_ROOM: [string, World][] = [
+  ['the session has no repository', { repo: null }],
+  ['the remote is not on GitHub', { repo: { ...REPO, remote: 'https://gitlab.com/o/n.git' } }],
+  ['no terminal shows the pane', { surfaces: ['desktop'] }],
+]
+NO_LINK_ROOM.forEach(([name, extra], i) => test(`the watch is not asked when ${name}`, async ($, on) => {
+  const w = world(on, { now: 680_000_000 + i * 1_000_000, store: { view: 'repo' }, page: () => ({ status: 200, text: WATCH_PAGE }), ...extra })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  await w.clock.advance(130000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.fetched).toEqual([])
+}))
+
+test('a watch that answered is not linked once the option names another address', async ($, on) => {
+  const w = world(on, { now: 690_000_000, store: { view: 'repo' }, page: () => ({ status: 200, text: WATCH_PAGE }) })
+  on('state.get', () => ({ value: { value: { shape: 'ada-4', value: { ...REPO_STATE, watch: 'http://127.0.0.1:9999/' } }, version: 1 } }))
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await ui.findAll({ type: 'Link' })).some(l => l.props.label === 'Watch')).toBe(false)
+  await ui.unmount()
+  expect(w.fetched).toEqual([])
+})
+
+test('the watch is asked only while the repo view is on screen, at most once in two minutes', async ($, on) => {
+  const cfg: World = { now: 670_000_000, page: () => ({ status: 200, text: WATCH_PAGE }) }
+  const w = world(on, cfg)
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'terminal', isInteractive: true })
+  await w.clock.settle()
+  expect(w.fetched.length).toBe(0)
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  await ui.press({ key: 'view-repo' })
+  expect(w.fetched.length).toBe(1)
+  await w.clock.advance(60000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.fetched.length).toBe(1)
+  await w.clock.advance(61000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.fetched.length).toBe(2)
+  cfg.shown = false
+  await w.clock.advance(200000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.fetched.length).toBe(2)
+  await ui.unmount()
 })
 
 // ---- Privacy ----

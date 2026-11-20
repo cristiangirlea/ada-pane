@@ -57,6 +57,11 @@ let runsAt = -Infinity
 let runsBusy = false
 let runsRefusedAt = -Infinity
 let runsLater: Timer | null = null
+let watchAt = -Infinity
+let watchBusy = false
+// Set from the plugin's options at register; null when the option names no loopback address.
+let watchUrl: string | null = 'http://127.0.0.1:8089/'
+const WATCH_TIMEOUT_MS = 2000
 
 async function change($: EngineInterface, fn: (s: AdaState) => AdaState) {
   try { await update($, pane, fn) } catch { /* Observation must not affect the session. */ }
@@ -207,6 +212,14 @@ export function weekStart(now: number) {
   const d = new Date(now)
   const day = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
   return day - ((d.getUTCDay() + 6) % 7) * 86400000
+}
+
+/** The watch's page for a `host:port` on this computer; null for any other host, so the pane never reaches out. */
+export function watchPage(address: unknown): string | null {
+  if (typeof address !== 'string') return null
+  const m = /^(127\.0\.0\.1|localhost|\[::1\]):(\d{1,5})$/.exec(address.trim())
+  const port = m ? Number(m[2]) : 0
+  return m && port >= 1 && port <= 65535 ? `http://${m[1]}:${port}/` : null
 }
 
 /** Still running: no result yet, and started recently enough not to be a run that stopped without one. */
@@ -657,10 +670,36 @@ async function refreshRuns($: EngineInterface) {
   } catch { /* The section stays as it was. */ } finally { runsBusy = false }
 }
 
+/** Which address answered as an hrn watch (its page's title ends in `· hrn watch`), or null. */
+async function refreshWatch($: EngineInterface) {
+  if (watchBusy || !watchUrl) return
+  try {
+    const state = await read($, pane)
+    if (state.view !== 'repo') return
+    const shown = await safely(() => $.ui.panes())
+    if (!shown?.some(p => p.id === 'ada' && p.isShown)) return
+    // The link sits among the GitHub links and is drawn on the terminal only: without either, nothing would show it.
+    if (!githubRepo((await safely(() => $.session.repo()))?.remote)) return
+    if (!(await safely(() => $.session.surfaces()))?.includes('terminal')) return
+    const now = await $.clock.now()
+    if (tooSoon(now, watchAt, PR_EVERY_MS)) return
+    watchAt = now
+    watchBusy = true
+    const url = watchUrl
+    // A server that accepts and never answers must not hold the reading.
+    const answer = await Promise.race([
+      $.http.fetch(url).then(r => r.status === 200 && /· hrn watch<\/title>/.test(r.text)).catch(() => false),
+      $.clock.sleep(WATCH_TIMEOUT_MS).then(() => false),
+    ])
+    await change($, s => ({ ...s, watch: answer ? url : null }))
+  } catch { await change($, s => ({ ...s, watch: null })) } finally { watchBusy = false }
+}
+
 /** What the repo view reads, each under its own limits; nothing unless the view is on screen. */
 async function refreshRepo($: EngineInterface) {
   await refreshPr($)
   await refreshRuns($)
+  await refreshWatch($)
   const state = await safely(() => read($, pane))
   const shown = await safely(() => $.ui.panes())
   const gh = githubRepo((await safely(() => $.session.repo()))?.remote)
@@ -692,7 +731,8 @@ const VIEWS: { id: AdaView; label: string }[] = [
 const clip = (text: string, n: number) => (text.length > n ? `${text.slice(0, n - 1)}…` : text)
 const plural = (n: number, one: string, many: string) => `${grouped(n)} ${n === 1 ? one : many}`
 
-export const register: Register = on => {
+export const register: Register = (on, options) => {
+  watchUrl = watchPage(options?.watch_address ?? '127.0.0.1:8089')
   on('session.start', async ($, e, next) => {
     const result = await next(e)
     try { await $.command.register({ name: 'ada', description: 'Open Ada’s session pane' }) } catch {}
@@ -1005,6 +1045,7 @@ export const register: Register = on => {
               <Link href={links.repository} label="Repository" />
               <Link href={links.pulls} label="Pull requests" />
               <Link href={links.actions} label="Actions" />
+              {terminal && watchUrl && state.watch === watchUrl && <Link href={watchUrl} label="Watch" />}
             </Box>
           ))}
           {delivery && delivery.top.length > 0 && section('Top repositories this week', (

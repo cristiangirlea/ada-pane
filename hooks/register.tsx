@@ -1,6 +1,6 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ProcessRunResult, Register, RenderChildren, SessionUsage, Timer } from 'claude-code'
-import type { AdaState, AdaView, CheckState, GitStatus, PrReading, PullRequest, Stats, TestRun, ToolBar } from '../types'
+import type { AdaState, AdaView, CheckState, Delivery, GitStatus, HrnRun, PrReading, PullRequest, Stats, TestRun, ToolBar } from '../types'
 
 const initial: AdaState = {
   stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'session',
@@ -8,15 +8,24 @@ const initial: AdaState = {
   lastTool: '', lastToolAt: 0, lastStatus: '', running: 0,
   calls: [], callCount: 0, failedCount: 0, slowest: null,
   turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null,
-  tests: null, editedSinceTests: false, git: null, pr: { kind: 'unknown' },
+  tests: null, editedSinceTests: false, git: null, pr: { kind: 'unknown' }, delivery: null, runs: null,
 }
 
 // The tag declines what a version with other fields stored.
-const pane = atom({ plugin: 'ada-pane', key: 'pane' } as const, initial, { shape: 'ada-3' })
+const pane = atom({ plugin: 'ada-pane', key: 'pane' } as const, initial, { shape: 'ada-4' })
 
 // hrn reads every run record: a first answer has taken over a minute.
+const STATS_ARGS = ['hrn', 'bot', 'stats', '--json'] as const
 const STATS_TIMEOUT_MS = 180000
 const STATS_EVERY_MS = 600000
+// Per repository hrn skips its slow walk and answers in well under a second; the spec gives it gh's limit.
+const REPO_STATS_TIMEOUT_MS = 8000
+const RUNS_TIMEOUT_MS = 8000
+const RUNS_LIVE_EVERY_MS = 30000
+// A run with no result this long after it started has stopped without one.
+const STALE_RUN_MS = 6 * 3600000
+// How long to remember that the installed hrn refused a newer flag before asking again.
+const FLAG_RETRY_MS = 3600000
 const GIT_TIMEOUT_MS = 3000
 const GIT_EVERY_MS = 10000
 const PR_TIMEOUT_MS = 8000
@@ -43,6 +52,11 @@ let gitLater: Timer | null = null
 let gitLaterAt = 0
 let prAt = -Infinity
 let prBusy = false
+let repoRefusedAt = -Infinity
+let runsAt = -Infinity
+let runsBusy = false
+let runsRefusedAt = -Infinity
+let runsLater: Timer | null = null
 
 async function change($: EngineInterface, fn: (s: AdaState) => AdaState) {
   try { await update($, pane, fn) } catch { /* Observation must not affect the session. */ }
@@ -78,24 +92,43 @@ export function parseStats(text: string): { stats: Stats | null; note: string } 
   }
 }
 
-async function refresh($: EngineInterface, force = false) {
+async function refresh($: EngineInterface, force = false, every = STATS_EVERY_MS) {
   try {
     const now = await $.clock.now()
     const state = await read($, pane)
-    if (statsBusy || state.refreshing || (!force && tooSoon(now, lastRefresh, STATS_EVERY_MS))) return
+    if (statsBusy || state.refreshing || (!force && tooSoon(now, lastRefresh, every))) return
     statsBusy = true
     lastRefresh = now
     await change($, s => ({ ...s, refreshing: true }))
+    const gh = githubRepo((await safely(() => $.session.repo()))?.remote)
+    const name = gh ? `${gh.owner}/${gh.name}` : ''
     let found: { stats: Stats | null; note: string } = { stats: null, note: 'hrn did not answer' }
+    let delivery: Delivery | null = null
+    let asked = false
     try {
-      const result = await $.process.run(['hrn', 'bot', 'stats', '--json'], { timeoutMs: STATS_TIMEOUT_MS })
-      if (result.exitCode === 0 && !result.isStdoutTruncated) found = parseStats(result.stdout)
+      let result: ProcessRunResult | null = null
+      if (name && !tooSoon(now, repoRefusedAt, FLAG_RETRY_MS)) {
+        // An hrn older than --repo refuses it, and one that runs out of time cannot give it: ask the old way,
+        // and not per repository again for a while.
+        try {
+          result = await $.process.run([...STATS_ARGS, '--repo', name], { timeoutMs: REPO_STATS_TIMEOUT_MS })
+        } catch { result = null }
+        if (!result || (result.exitCode !== 0 && /unexpected argument|--repo/.test(result.stderr))) {
+          repoRefusedAt = now
+          result = null
+        } else asked = true
+      }
+      result ??= await $.process.run(STATS_ARGS, { timeoutMs: STATS_TIMEOUT_MS })
+      if (result.exitCode === 0 && !result.isStdoutTruncated) {
+        found = parseStats(result.stdout)
+        if (asked) delivery = parseDelivery(result.stdout, name)
+      }
     } catch { found = { stats: null, note: 'hrn is not installed, or did not answer in time' } }
     const at = await $.clock.now()
     if (found.stats) {
       const stats = found.stats
-      try { await $.store.set('stats', { at, stats }) } catch { /* The next session reads hrn again. */ }
-      await change($, s => ({ ...s, stats, statsAt: at, statsNote: '', refreshing: false }))
+      try { await $.store.set('stats', { at, stats, delivery }) } catch { /* The next session reads hrn again. */ }
+      await change($, s => ({ ...s, stats, statsAt: at, statsNote: '', refreshing: false, delivery }))
     } else {
       // An earlier answer stays on show beside the reason there is no new one.
       await change($, s => ({ ...s, statsNote: found.note, refreshing: false }))
@@ -110,12 +143,74 @@ async function recall($: EngineInterface) {
     if (view === 'session' || view === 'repo' || view === 'you') await change($, s => ({ ...s, view }))
   } catch { /* Session is the default. */ }
   try {
-    const kept = await $.store.get('stats') as { at?: unknown; stats?: unknown } | null | undefined
+    const kept = await $.store.get('stats') as { at?: unknown; stats?: unknown; delivery?: unknown } | null | undefined
     if (!kept || typeof kept.at !== 'number' || !kept.stats) return
     const { stats } = parseStats(JSON.stringify(toWire(kept.stats as Stats)))
-    if (stats) await change($, s => (s.stats ? s : { ...s, stats, statsAt: kept.at as number }))
+    const gh = githubRepo((await safely(() => $.session.repo()))?.remote)
+    let keptDelivery: Delivery | null = null
+    // A delivery from an earlier week would show last week's figures as this week's.
+    if (gh && kept.delivery && kept.at >= weekStart(await $.clock.now())) {
+      try { keptDelivery = parseDelivery(JSON.stringify(deliveryWire(kept.delivery as Delivery)), `${gh.owner}/${gh.name}`) } catch { keptDelivery = null }
+    }
+    if (stats) await change($, s => (s.stats ? s : { ...s, stats, statsAt: kept.at as number, delivery: keptDelivery }))
   } catch { /* Nothing kept. */ }
 }
+
+/** A kept delivery in the shape hrn prints, so it is read back through the same checks. */
+const deliveryWire = (d: Delivery) => ({
+  week: { delivery: d.total },
+  repo: { name: d.name, week: d.week, days: d.days, kinds: Object.fromEntries(d.kinds.map(k => [k.kind, k.count])), share: d.share },
+  top: d.top,
+})
+
+/** This repository's delivery from `hrn bot stats --json --repo`; null when the answer is not one for it. */
+export function parseDelivery(text: string, name: string): Delivery | null {
+  let raw: Record<string, unknown>
+  try { raw = JSON.parse(text) } catch { return null }
+  const repo = raw && typeof raw === 'object' ? raw.repo as Record<string, unknown> | undefined : undefined
+  if (!repo || typeof repo !== 'object' || typeof repo.name !== 'string' || repo.name.toLowerCase() !== name.toLowerCase()) return null
+  if (!Array.isArray(repo.days) || repo.days.length !== 35 || !Array.isArray(raw.top)) return null
+  const share = typeof repo.share === 'number' && Number.isFinite(repo.share) ? Math.min(1, Math.max(0, repo.share)) : 0
+  const kinds = Object.entries(repo.kinds && typeof repo.kinds === 'object' ? repo.kinds as Record<string, unknown> : {})
+    .filter((k): k is [string, number] => /^[a-z_]{1,40}$/.test(k[0]) && typeof k[1] === 'number' && k[1] > 0)
+    .map(([kind, count]) => ({ kind, count: whole(count) }))
+    .sort((a, b) => b.count - a.count || (a.kind < b.kind ? -1 : 1))
+    .slice(0, 3)
+  const top = raw.top
+    .map(t => (t && typeof t === 'object' ? t : {}) as Record<string, unknown>)
+    .filter(t => typeof t.repo === 'string' && isOwnerName(t.repo) && typeof t.week === 'number')
+    .slice(0, 5)
+    .map(t => ({ repo: t.repo as string, week: whole(t.week) }))
+  const week = (raw.week ?? {}) as Record<string, unknown>
+  return {
+    name, week: whole(repo.week), total: whole(week.delivery), days: repo.days.map(whole), kinds, share, top,
+  }
+}
+
+/** One repository's runs from `hrn runs --json --repo`; null when the answer is not one. */
+export function parseRuns(text: string): HrnRun[] | null {
+  let raw: Record<string, unknown>
+  try { raw = JSON.parse(text) } catch { return null }
+  if (!raw || typeof raw !== 'object' || raw.version !== 1 || !Array.isArray(raw.runs)) return null
+  const word = (v: unknown, fallback: string) => (typeof v === 'string' && /^[A-Za-z0-9_.-]{1,24}$/.test(v) ? v : fallback)
+  return raw.runs.slice(0, 8)
+    .map(r => (r && typeof r === 'object' ? r : {}) as Record<string, unknown>)
+    .filter(r => typeof r.id === 'string' && typeof r.started === 'string' && Number.isFinite(Date.parse(r.started)))
+    .map(r => ({
+      id: word(r.id, '?'), backend: word(r.backend, 'unknown'), status: word(r.status, 'unknown'),
+      started: Date.parse(r.started as string), ms: whole(r.duration_ms),
+    }))
+}
+
+/** Monday 00:00 UTC on or before now, where hrn's week starts. */
+export function weekStart(now: number) {
+  const d = new Date(now)
+  const day = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
+  return day - ((d.getUTCDay() + 6) % 7) * 86400000
+}
+
+/** Still running: no result yet, and started recently enough not to be a run that stopped without one. */
+export const isLive = (run: HrnRun, now: number) => run.status === 'running' && now - run.started < STALE_RUN_MS
 
 const toWire = (s: Stats) => ({
   enabled: true, level: s.level, xp: s.xp, streak: s.streak, week: s.week, days: s.days, badges: s.badges,
@@ -236,13 +331,18 @@ export function readPullRequestFailure(err: unknown): PrReading {
   return /ENOENT|not found|cannot start|could not start|no such file/i.test(message) ? { kind: 'note', note: 'gh is not installed' } : { kind: 'hidden' }
 }
 
+/** `owner/name` as GitHub spells it: a name may start with a dot (`.github`) but is never `.` or `..`. */
+export function isOwnerName(s: string) {
+  const m = /^[A-Za-z0-9_-][A-Za-z0-9_.-]*\/([A-Za-z0-9_.-]+)$/.exec(s)
+  return !!m && m[1] !== '.' && m[1] !== '..'
+}
+
 /** `owner/name` of a GitHub remote, in https, scp or ssh spelling; null for any other host. */
 export function githubRepo(remote: string | null | undefined): { owner: string; name: string } | null {
   if (typeof remote !== 'string') return null
   const m = /^(?:https:\/\/(?:[^@/\s]+@)?github\.com\/|git@github\.com:|ssh:\/\/git@github\.com(?::\d+)?\/)([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+?)(?:\.git)?\/?$/i.exec(remote.trim())
   const [, owner = '', name = ''] = m ?? []
-  if (!owner || !name || owner.startsWith('.') || name.startsWith('.')) return null
-  return { owner, name }
+  return isOwnerName(`${owner}/${name}`) ? { owner, name } : null
 }
 
 /** Built from owner and name alone, so nothing else in the remote (a token) reaches a link. */
@@ -442,6 +542,31 @@ export function strip(calls: ToolBar[]) {
   return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 238 28" width="238" height="28"><title>The last ${shown.length} tool calls</title>${bars}</svg>`
 }
 
+/** Thirty-five days of delivery in this repository, one bar a day, height by experience. */
+export function deliveryStrip(days: number[]) {
+  const top = Math.max(1, ...days)
+  const bars = days.slice(-35).map((xp, i) => {
+    const h = xp > 0 ? Math.max(3, Math.round((xp / top) * 24)) : 2
+    return `<rect x="${i * 6}" y="${24 - h}" width="4" height="${h}" rx="1" fill="${xp > 0 ? OK_FILL : UNFILLED}" fill-opacity="${xp > 0 ? 1 : 0.5}"/>`
+  }).join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 208 24" width="208" height="24"><title>Delivery in the last 35 days</title>${bars}</svg>`
+}
+
+const KIND_WORDS: Record<string, [string, string]> = {
+  inside_ceiling: ['run inside its ceiling', 'runs inside their ceiling'],
+  review_clean: ['clean review', 'clean reviews'],
+  bug_squashed: ['bug squashed', 'bugs squashed'],
+  script_reused: ['kept script reused', 'kept scripts reused'],
+  routed_passed: ['routed run passed', 'routed runs passed'],
+  first_use: ['first use', 'first uses'],
+}
+
+/** `41 runs inside their ceiling`; a kind this build does not know reads as its words. */
+export function kindLine(kind: string, count: number) {
+  const [one, many] = KIND_WORDS[kind] ?? [kind.replace(/_/g, ' '), kind.replace(/_/g, ' ')]
+  return `${grouped(count)} ${count === 1 ? one : many}`
+}
+
 /** The last 35 days as a grid of weeks, a filled square for a day with practice. */
 export function dayGrid(days: boolean[]) {
   const cells = days.slice(-35)
@@ -502,6 +627,50 @@ async function refreshPr($: EngineInterface) {
   } catch { /* The section stays as it was. */ } finally { prBusy = false }
 }
 
+async function refreshRuns($: EngineInterface) {
+  if (runsBusy) return
+  try {
+    const state = await read($, pane)
+    if (state.view !== 'repo') return
+    const shown = await safely(() => $.ui.panes())
+    if (!shown?.some(p => p.id === 'ada' && p.isShown)) return
+    const now = await $.clock.now()
+    if (tooSoon(now, runsRefusedAt, FLAG_RETRY_MS)) return
+    const live = state.runs?.some(run => isLive(run, now)) ?? false
+    if (tooSoon(now, runsAt, live ? RUNS_LIVE_EVERY_MS : PR_EVERY_MS)) return
+    const gh = githubRepo((await $.session.repo())?.remote)
+    if (!gh) { await change($, s => ({ ...s, runs: null })); return }
+    runsAt = now
+    runsBusy = true
+    let runs: HrnRun[] | null = null
+    try {
+      const result = await $.process.run(['hrn', 'runs', '--json', '--repo', `${gh.owner}/${gh.name}`, '-n', '8'], { timeoutMs: RUNS_TIMEOUT_MS })
+      if (result.exitCode === 0 && !result.isStdoutTruncated) runs = parseRuns(result.stdout)
+      // An hrn older than --json refuses it: leave the section out for a while.
+      else if (/not defined|unknown flag/.test(result.stderr)) runsRefusedAt = now
+    } catch { runs = null }
+    await change($, s => ({ ...s, runs }))
+    // While a run is live the section follows it; once none is, it waits for the next turn or view.
+    if (runs?.some(run => isLive(run, now)) && !runsLater) {
+      try { runsLater = $.clock.after(RUNS_LIVE_EVERY_MS, () => { runsLater = null; void refreshRuns($) }) } catch { runsLater = null }
+    }
+  } catch { /* The section stays as it was. */ } finally { runsBusy = false }
+}
+
+/** What the repo view reads, each under its own limits; nothing unless the view is on screen. */
+async function refreshRepo($: EngineInterface) {
+  await refreshPr($)
+  await refreshRuns($)
+  const state = await safely(() => read($, pane))
+  const shown = await safely(() => $.ui.panes())
+  const gh = githubRepo((await safely(() => $.session.repo()))?.remote)
+  const now = await safely(() => $.clock.now()) ?? 0
+  // Only the quick per-repository answer is worth asking this often; the full one waits for its own time.
+  if (gh && !tooSoon(now, repoRefusedAt, FLAG_RETRY_MS) && state?.view === 'repo' && shown?.some(p => p.id === 'ada' && p.isShown)) {
+    await refresh($, false, PR_EVERY_MS)
+  }
+}
+
 function startTicker($: EngineInterface) {
   stopTicker()
   try { ticker = $.clock.every(1000, () => { void change($, s => (s.turnStartedAt ? { ...s, tick: s.tick + 1 } : s)) }) } catch { ticker = null }
@@ -532,7 +701,7 @@ export const register: Register = on => {
     if ((await safely(() => read($, pane)))?.turnStartedAt) startTicker($)
     void recall($).then(async () => {
       await refreshGit($)
-      await refreshPr($)
+      await refreshRepo($)
       await refresh($)
     })
     return result
@@ -599,7 +768,7 @@ export const register: Register = on => {
       ...(e.isAborted ? { reaction: 'Stopped. Over to you.', mood: 'idle' as const }
         : s.mood === 'busy' ? { reaction: 'Done. What’s next?', mood: 'idle' as const } : {}),
     }))
-    void refreshGit($).then(() => refreshPr($)).then(() => refresh($))
+    void refreshGit($).then(() => refreshRepo($)).then(() => refresh($))
     return result
   })
   on('ui.render', { component: 'Pane', requestId: 'ada' }, async ($, e) => {
@@ -619,7 +788,7 @@ export const register: Register = on => {
     const show = (next: AdaView) => () => {
       void change($, s => ({ ...s, view: next })).then(async () => {
         try { await $.store.set('view', next) } catch { /* The next session opens on Session. */ }
-        if (next === 'repo') await refreshPr($)
+        if (next === 'repo') await refreshRepo($)
       })
     }
     const fill = (text: string) => () => { void $.prompt.fill({ text, mode: 'insert' }) }
@@ -651,6 +820,8 @@ export const register: Register = on => {
       running: pr.checks.filter(c => c === 'running').length,
     } : null
 
+    // Readings of another repository (the session moved) are not this one's.
+    const delivery = state.delivery && gh && state.delivery.name.toLowerCase() === `${gh.owner}/${gh.name}`.toLowerCase() ? state.delivery : null
     // ---- Header ----
     let ringPercent: number | null = null
     let ringSource = ''
@@ -668,8 +839,9 @@ export const register: Register = on => {
         : state.turnStartedAt || state.running ? chip('Working', 'warning')
           : state.lastTurn || state.callCount ? chip('Done', 'success') : null
     } else if (view === 'repo') {
-      ringSource = ring(null, { mood: state.mood })
-      ringAlt = 'Ada'
+      ringPercent = delivery ? delivery.share * 100 : null
+      ringSource = ring(ringPercent, { mood: state.mood })
+      ringAlt = delivery ? `Ada, ${percentText(ringPercent ?? 0)} of the week’s delivery` : 'Ada'
       title = clip(gh ? gh.name : repo?.name ?? (repo?.root.split(/[\\/]/).filter(Boolean).pop() || 'This repository'), 40)
       under = state.git ? state.git.head : ''
       right = !checks || pr?.checks.length === 0 ? null
@@ -761,6 +933,7 @@ export const register: Register = on => {
     // ---- Repo ----
     const repoView = () => {
       const git = state.git
+      const runs = gh ? state.runs : null
       const links = gh ? repoLinks(gh) : null
       const branchLine = git ? [
         git.changed ? plural(git.changed, 'file changed', 'files changed') : 'No changes',
@@ -797,11 +970,51 @@ export const register: Register = on => {
               {prPart}
             </Box>
           ))}
+          {delivery && section('Delivered here', delivery.week === 0 && delivery.days.every(d => d === 0)
+            ? <Text dimColor>Nothing delivered here yet</Text>
+            : (
+              <Box flexDirection="column">
+                <Box flexDirection="row" gap={2} alignItems="center">
+                  <Text size="title" mono tabular>{grouped(delivery.week)}</Text>
+                  <Box flexDirection="column" flexGrow={1}>
+                    <Progress label="This week" value={delivery.week} max={Math.max(1, delivery.total, delivery.week)}
+                      valueText={`${grouped(delivery.week)} of ${grouped(delivery.total)}`} color="success" />
+                  </Box>
+                </Box>
+                {terminal
+                  ? <Text color="success">{blockRuns(delivery.days.map(xp => ({ tool: '', ms: xp, ok: true }))).map(r => r.text).join('')}</Text>
+                  : picture(deliveryStrip(delivery.days), `Delivery here on ${delivery.days.filter(d => d > 0).length} of the last 35 days`)}
+                {delivery.kinds.map(k => <Text size="caption" dimColor>{kindLine(k.kind, k.count)}</Text>)}
+                {now - state.statsAt > 600000 && <Text size="caption" dimColor>Read {age(now, state.statsAt)}</Text>}
+              </Box>
+            ))}
+          {runs && section('Runs here', runs.length === 0
+            ? <Text dimColor>No hrn runs here in the last 14 days</Text>
+            : (
+              <Box flexDirection="column">
+                {runs.filter(r => isLive(r, now)).slice(0, 3).map(r => (
+                  <Text size="caption"><Text color="warning">●</Text> {r.backend}, running {duration(now - r.started)}</Text>
+                ))}
+                {runs.filter(r => !isLive(r, now)).slice(0, 5).map(r => (r.status === 'running'
+                  ? <Text size="caption"><Text dimColor>●</Text> {r.backend}, stopped without a result, {age(now, r.started)}</Text>
+                  : <Text size="caption"><Text color={r.status === 'ok' ? 'success' : 'error'}>●</Text> {r.backend}, {duration(r.ms)}, {age(now, r.started + r.ms)}</Text>))}
+              </Box>
+            ))}
           {links && section('Links', (
             <Box flexDirection="row" gap={2} flexWrap="wrap">
               <Link href={links.repository} label="Repository" />
               <Link href={links.pulls} label="Pull requests" />
               <Link href={links.actions} label="Actions" />
+            </Box>
+          ))}
+          {delivery && delivery.top.length > 0 && section('Top repositories this week', (
+            <Box flexDirection="column">
+              {delivery.top.map(t => (
+                <Text size="caption" dimColor={t.repo.toLowerCase() !== delivery.name.toLowerCase()}
+                  weight={t.repo.toLowerCase() === delivery.name.toLowerCase() ? 'semibold' : undefined}>
+                  {t.repo}, {grouped(t.week)}{t.repo.toLowerCase() === delivery.name.toLowerCase() ? ' (this one)' : ''}
+                </Text>
+              ))}
             </Box>
           ))}
         </Box>

@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import {
-  age, barHeights, blockRuns, checkState, chooseAction, contextPercent, dayGrid, duration, githubRepo, levelSpan, macaw,
+  age, barHeights, deliveryStrip, isLive, kindLine, parseDelivery, parseRuns, weekStart, blockRuns, checkState, chooseAction, contextPercent, dayGrid, duration, githubRepo, levelSpan, macaw,
   parseGitStatus, parsePullRequest, parseStats, percentText, planFigure, pushCall, readPullRequest, readPullRequestFailure,
   record, repoLinks, resetsIn, ring, stopwatch, strip, testRunner, tokenCount,
 } from './register'
@@ -61,7 +61,10 @@ type World = {
   repo?: typeof REPO | { root: string; remote: string | null; internal: boolean; name: string | null } | null
   git?: () => Answer
   gh?: () => Answer
-  hrn?: () => Answer
+  /** `hrn bot stats`; the arguments say whether it was asked per repository. */
+  hrn?: (argv: string[]) => Answer
+  /** `hrn runs`; unset answers as an hrn without --json does. */
+  runs?: (argv: string[]) => Answer
   store?: Record<string, unknown>
   /** Whether the pane is the one its surface shows (true when not given). */
   shown?: boolean
@@ -90,7 +93,8 @@ function world(on: On, w: World = {}) {
     runs.push({ argv: [...e.argv], cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
     if (e.argv[0] === 'git') return w.git ? w.git() : ran(GIT_CLEAN)
     if (e.argv[0] === 'gh') return w.gh ? w.gh() : ran('', 1, 'no pull requests found for branch "pane-look"')
-    return w.hrn ? w.hrn() : ran('', 1)
+    if (e.argv[1] === 'runs') return w.runs ? w.runs([...e.argv]) : ran('', 2, 'flag provided but not defined: -json')
+    return w.hrn ? w.hrn([...e.argv]) : ran('', 1)
   })
   on('prompt.fill', (_, e) => { filled.push(e.text); return { isFilled: true, text: e.text, cursor: e.text.length } })
   on('prompt.submit', (_, e) => ({ text: e.text }))
@@ -237,6 +241,8 @@ test('links only for a GitHub remote, in https and git@ spelling, built from own
   expect(githubRepo('https://github.com.evil.example/o/n')).toBe(null)
   expect(githubRepo('https://github.com/o/n/extra')).toBe(null)
   expect(githubRepo('https://github.com/../n')).toBe(null)
+  expect(githubRepo('https://github.com/o/..')).toBe(null)
+  expect(githubRepo('git@github.com:o/.github.git')).toEqual({ owner: 'o', name: '.github' })
   expect(githubRepo(null)).toBe(null)
   const links = repoLinks({ owner: 'o', name: 'n' })
   expect([links.repository, links.pulls, links.actions, links.pull(3), links.issue(1)]).toEqual([
@@ -540,12 +546,16 @@ test('state “stats never read” draws without an error', async ($, on) => {
   }
 })
 
-test('state an earlier build kept under ada-2 is reset, not read', async ($, on) => {
-  world(on, { now: 190_000_000 })
-  on('state.get', () => ({
-    value: { value: { shape: 'ada-2', value: { stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'progress', prompts: 3,
-      started: 2, finished: 2, lastTool: 'Bash', lastStatus: 'ok', reaction: 'Old words.', mood: 'idle', recordingFailed: false } }, version: 1 },
-  }))
+const OLD_STATES: [string, Record<string, unknown>][] = [
+  ['ada-2', { stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'progress', prompts: 3,
+    started: 2, finished: 2, lastTool: 'Bash', lastStatus: 'ok', reaction: 'Old words.', mood: 'idle', recordingFailed: false }],
+  ['ada-3', { stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'repo', reaction: 'Old words.', mood: 'idle',
+    recordingFailed: false, lastTool: 'Bash', lastToolAt: 0, lastStatus: 'ok', running: 0, calls: [], callCount: 0, failedCount: 0,
+    slowest: null, turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null, tests: null, editedSinceTests: false, git: null, pr: { kind: 'unknown' } }],
+]
+OLD_STATES.forEach(([shape, value], i) => test(`state an earlier build kept under ${shape} is reset, not read`, async ($, on) => {
+  world(on, { now: 190_000_000 + i * 1_000_000, repo: null })
+  on('state.get', () => ({ value: { value: { shape, value }, version: 1 } }))
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...pane, surface })
     const all = await texts(ui)
@@ -554,10 +564,10 @@ test('state an earlier build kept under ada-2 is reset, not read', async ($, on)
     expect((await ui.find({ key: 'view-session' }))?.props.variant).toBe('primary')
     await ui.unmount()
   }
-})
+}))
 
 test('stats from hrn are kept and drawn in the you view, and Refresh asks again', async ($, on) => {
-  const w = world(on, { now: 210_000_000, hrn: () => ran(JSON.stringify(wire)) })
+  const w = world(on, { now: 210_000_000, repo: null, hrn: () => ran(JSON.stringify(wire)) })
   await $.command.run(slash('ada'))
   await w.clock.settle()
   const hrns = () => w.runs.filter(r => r.argv[0] === 'hrn')
@@ -742,10 +752,344 @@ test('with usage not known yet, the ring has no fill', async ($, on) => {
   await ui.unmount()
 })
 
+// ---- Delivered here and runs here ----
+
+const REPO_NAME = 'cristiangirlea/ada-pane'
+
+const repoWire = {
+  ...wire, week: { delivery: 1820, practice: 30 }, familiarity: null,
+  repo: {
+    name: REPO_NAME, week: 545, days: [...Array(33).fill(0), 100, 445],
+    kinds: { inside_ceiling: 41, review_clean: 6, bug_squashed: 2, script_reused: 1, routed_failed: 0 }, share: 0.2995,
+  },
+  top: [{ repo: 'cristiangirlea/harness', week: 900 }, { repo: REPO_NAME, week: 545 }, { repo: '../bad', week: 5 }],
+}
+
+const runsWire = (now: number) => ({
+  version: 1,
+  runs: [
+    { id: 'r1', backend: 'claude', status: 'running', started: new Date(now - 12 * 60000).toISOString(), duration_ms: 0, repo: 'github.com/' + REPO_NAME, branch: 'x' },
+    { id: 'r0', backend: 'codex', status: 'running', started: new Date(now - 8 * 3600000).toISOString(), duration_ms: 0, repo: 'github.com/' + REPO_NAME, branch: '' },
+    { id: 'r2', backend: 'codex', status: 'ok', started: new Date(now - 2 * 3600000).toISOString(), duration_ms: 192000, repo: 'github.com/' + REPO_NAME, branch: '' },
+    { id: 'r3', backend: 'claude', status: 'error', started: new Date(now - 3 * 3600000).toISOString(), duration_ms: 45000, repo: 'github.com/' + REPO_NAME, branch: '' },
+  ],
+})
+
+test('hrn’s per-repository answers are read with care', () => {
+  const d = parseDelivery(JSON.stringify(repoWire), 'CristianGirlea/Ada-Pane')
+  expect(d).toEqual({
+    name: 'CristianGirlea/Ada-Pane', week: 545, total: 1820, days: [...Array(33).fill(0), 100, 445],
+    kinds: [{ kind: 'inside_ceiling', count: 41 }, { kind: 'review_clean', count: 6 }, { kind: 'bug_squashed', count: 2 }],
+    share: 0.2995, top: [{ repo: 'cristiangirlea/harness', week: 900 }, { repo: REPO_NAME, week: 545 }],
+  })
+  expect(parseDelivery(JSON.stringify(repoWire), 'someone/else')).toBe(null)
+  expect(parseDelivery(JSON.stringify(wire), REPO_NAME)).toBe(null)
+  expect(parseDelivery(JSON.stringify({ ...repoWire, repo: { ...repoWire.repo, days: [1, 2] } }), REPO_NAME)).toBe(null)
+  expect(parseDelivery(JSON.stringify({ ...repoWire, repo: { ...repoWire.repo, share: 7 } }), REPO_NAME)?.share).toBe(1)
+  expect(parseDelivery('not json', REPO_NAME)).toBe(null)
+  const now = Date.parse('2026-11-20T12:00:00Z')
+  const runs = parseRuns(JSON.stringify(runsWire(now)))
+  expect(runs?.map(r => [r.id, r.status, r.ms])).toEqual([['r1', 'running', 0], ['r0', 'running', 0], ['r2', 'ok', 192000], ['r3', 'error', 45000]])
+  expect(runs?.filter(r => isLive(r, now)).map(r => r.id)).toEqual(['r1'])
+  expect(parseRuns(JSON.stringify({ version: 2, runs: [] }))).toBe(null)
+  expect(parseRuns(JSON.stringify({ version: 1, runs: [{ id: 'x', backend: '<b>', status: 'ok', started: 'never' }] }))).toEqual([])
+  expect(parseRuns(JSON.stringify({ version: 1, runs: [{ id: 'x', backend: '<b>', status: 'ok', started: '2026-11-20T10:00:00Z', duration_ms: -4 }] })))
+    .toEqual([{ id: 'x', backend: 'unknown', status: 'ok', started: Date.parse('2026-11-20T10:00:00Z'), ms: 0 }])
+  expect(kindLine('inside_ceiling', 41)).toBe('41 runs inside their ceiling')
+  expect(kindLine('review_clean', 1)).toBe('1 clean review')
+  expect(kindLine('something_new', 3)).toBe('3 something new')
+  const strip35 = deliveryStrip([...Array(33).fill(0), 100, 445])
+  expect((strip35.match(/<rect /g) ?? []).length).toBe(35)
+  expect(/<script|on\w+=|href=/i.test(strip35)).toBe(false)
+})
+
+test('stats are asked per repository, with a short limit, where the session has a GitHub repository', async ($, on) => {
+  const w = world(on, { now: 400_000_000, hrn: () => ran(JSON.stringify(repoWire)) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const stats = w.runs.filter(r => r.argv[1] === 'bot')
+  expect(stats.length).toBe(1)
+  expect(stats[0]).toEqual({ argv: ['hrn', 'bot', 'stats', '--json', '--repo', REPO_NAME], cwd: undefined, timeoutMs: 8000 })
+  expect((w.store.get('stats') as { delivery: { week: number } }).delivery.week).toBe(545)
+})
+
+test('an hrn that refuses --repo is asked the old way, and not per repository again for an hour', async ($, on) => {
+  const w = world(on, { now: 410_000_000, hrn: argv => (argv.includes('--repo') ? ran('', 1, 'hrn: unexpected argument "--repo": hrn bot stats takes none') : ran(JSON.stringify(wire))) })
+  const stats = () => w.runs.filter(r => r.argv[1] === 'bot').map(r => [r.argv.length, r.timeoutMs])
+  await $.command.run(slash('ada'))
+  await w.clock.settle()
+  expect(stats()).toEqual([[6, 8000], [4, 180000]])
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  await ui.press({ key: 'view-you' })
+  expect((await texts(ui)).includes('Level 9')).toBe(true)
+  await ui.press({ key: 'refresh' })
+  expect(stats().slice(2)).toEqual([[4, 180000]])
+  await w.clock.advance(3_700_000)
+  await ui.press({ key: 'refresh' })
+  expect(stats().slice(3)).toEqual([[6, 8000], [4, 180000]])
+  await ui.unmount()
+})
+
+test('the repo view draws what was delivered here, the runs here and the top repositories', async ($, on) => {
+  const now = 420_000_000
+  const w = world(on, { now, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(runsWire(now))) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(w.runs.filter(r => r.argv[1] === 'runs').map(r => r.argv)).toEqual([['hrn', 'runs', '--json', '--repo', REPO_NAME, '-n', '8']])
+  expect(w.runs.find(r => r.argv[1] === 'runs')?.timeoutMs).toBe(8000)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    for (const words of ['Delivered here', '545', 'This week 545 of 1,820', '41 runs inside their ceiling', '6 clean reviews', '2 bugs squashed',
+      'Runs here', 'claude, running 12 m', 'codex, 3 m 12 s, 1 h ago', 'claude, 45 s, 2 h ago', 'Top repositories this week',
+      'cristiangirlea/harness, 900', `${REPO_NAME}, 545 (this one)`]) {
+      expect([surface, words, all.includes(words)]).toEqual([surface, words, true])
+    }
+    // A run that never ended long ago is not running now.
+    expect(all.includes('codex, running')).toBe(false)
+    expect(all.includes('1 kept script reused')).toBe(false)
+    expect(all.includes('../bad')).toBe(false)
+    if (surface === 'terminal') {
+      expect(all.includes('30%')).toBe(true)
+      expect(all.includes('▁'.repeat(33))).toBe(true)
+    } else {
+      const sources = (await ui.findAll({ type: 'Svg' })).map(x => String(x.props.source))
+      expect(sources[0]?.includes('stroke-dasharray="37.64 125.66"')).toBe(true)
+      expect(sources.some(src => src.includes('Delivery in the last 35 days'))).toBe(true)
+    }
+    await ui.unmount()
+  }
+})
+
+test('state “nothing delivered here yet” draws without an error', async ($, on) => {
+  const empty = { ...repoWire, repo: { name: REPO_NAME, week: 0, days: Array(35).fill(0), kinds: {}, share: 0 }, top: [] }
+  const w = world(on, { now: 430_000_000, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(empty)), runs: () => ran('{"version":1,"runs":[]}') })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect(all.includes('Nothing delivered here yet')).toBe(true)
+    expect(all.includes('No hrn runs here in the last 14 days')).toBe(true)
+    expect(all.includes('Top repositories')).toBe(false)
+    await ui.unmount()
+  }
+})
+
+test('state “hrn without --repo” draws the repo view without what hrn cannot give', async ($, on) => {
+  const w = world(on, { now: 440_000_000, store: { view: 'repo' }, hrn: argv => (argv.includes('--repo') ? ran('', 1, 'unexpected argument "--repo"') : ran(JSON.stringify(wire))) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect(all.includes('This branch')).toBe(true)
+    expect(all.includes('Links')).toBe(true)
+    for (const words of ['Delivered here', 'Runs here', 'Top repositories']) expect([words, all.includes(words)]).toEqual([words, false])
+    await ui.unmount()
+  }
+})
+
+test('runs are asked every 30 seconds while one is live, and otherwise as gh is', async ($, on) => {
+  const now = 450_000_000
+  let live = true
+  const cfg: World = {
+    now, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(repoWire)),
+    runs: () => ran(JSON.stringify(live ? runsWire(now) : { version: 1, runs: runsWire(now).runs.filter(r => r.id !== 'r1') })),
+  }
+  const w = world(on, cfg)
+  const asked = () => w.runs.filter(r => r.argv[1] === 'runs').length
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(asked()).toBe(1)
+  await w.clock.advance(30000)
+  expect(asked()).toBe(2)
+  live = false
+  await w.clock.advance(30000)
+  expect(asked()).toBe(3)
+  // No run is live now: no timer, and a turn's end asks only once 2 minutes have passed since the last answer.
+  await w.clock.advance(60000)
+  expect(asked()).toBe(3)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(asked()).toBe(3)
+  await w.clock.advance(70000)
+  expect(asked()).toBe(3)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(asked()).toBe(4)
+  cfg.shown = false
+  await w.clock.advance(200000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(asked()).toBe(4)
+})
+
+const KEPT: [string, boolean][] = [['https://github.com/cristiangirlea/ada-pane.git', true], ['https://github.com/cristiangirlea/other.git', false]]
+KEPT.forEach(([remote, shown], i) => test(`a kept delivery shows at once for its own repository only (${shown ? 'same' : 'another'})`, async ($, on) => {
+  const kept = parseDelivery(JSON.stringify(repoWire), REPO_NAME)
+  const stats = parseStats(JSON.stringify(wire)).stats
+  const w = world(on, { now: 460_000_000 + i * 1_000_000, repo: { ...REPO, remote }, store: { view: 'repo', stats: { at: 459_000_000, stats, delivery: kept } }, hrn: () => ran('', 1, 'busy') })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(ui)).includes('Delivered here')).toBe(shown)
+  await ui.unmount()
+}))
+
+test('the 2-minute stats reading runs only while the repo view is on screen', async ($, on) => {
+  const cfg: World = { now: 470_000_000, hrn: () => ran(JSON.stringify(repoWire)) }
+  const w = world(on, cfg)
+  const stats = () => w.runs.filter(r => r.argv[1] === 'bot').length
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(stats()).toBe(1)
+  // Session view: turn ends 3 and 6 minutes on ask nothing (the full reading waits 10 minutes).
+  for (const at of [180000, 180000]) {
+    await w.clock.advance(at)
+    await $.turn.complete(turnDone(1000))
+    await w.clock.settle()
+  }
+  expect(stats()).toBe(1)
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  await ui.press({ key: 'view-repo' })
+  expect(stats()).toBe(2)
+  cfg.shown = false
+  await w.clock.advance(150000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(stats()).toBe(2)
+  await ui.unmount()
+})
+
+test('an hrn that refuses runs --json is not asked again for an hour', async ($, on) => {
+  const w = world(on, { now: 480_000_000, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(repoWire)) })
+  const asked = () => w.runs.filter(r => r.argv[1] === 'runs').length
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(asked()).toBe(1)
+  for (const step of [180000, 1_620_000]) {
+    await w.clock.advance(step)
+    await $.turn.complete(turnDone(1000))
+    await w.clock.settle()
+  }
+  expect(asked()).toBe(1)
+  await w.clock.advance(1_900_000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(asked()).toBe(2)
+})
+
+const LEAVING: [string, (cfg: World, ui: { press: (t: { key: string }) => Promise<unknown> }) => Promise<void>][] = [
+  ['the you view is chosen', async (_, ui) => { await ui.press({ key: 'view-you' }) }],
+  ['the pane is hidden', async cfg => { cfg.shown = false }],
+]
+LEAVING.forEach(([name, leave], i) => test(`a live run is not followed once ${name}`, async ($, on) => {
+  const now = 490_000_000 + i * 10_000_000
+  const cfg: World = { now, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(runsWire(now))) }
+  const w = world(on, cfg)
+  const asked = () => w.runs.filter(r => r.argv[1] === 'runs').length
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect(asked()).toBe(1)
+  await leave(cfg, ui)
+  await w.clock.advance(30000)
+  await w.clock.advance(30000)
+  expect(asked()).toBe(1)
+  await ui.unmount()
+}))
+
+test('an old hrn in the repo view never runs the slow full reading on every turn', async ($, on) => {
+  const w = world(on, { now: 520_000_000, store: { view: 'repo' }, hrn: argv => (argv.includes('--repo') ? ran('', 1, 'unexpected argument "--repo"') : ran(JSON.stringify(wire))) })
+  const full = () => w.runs.filter(r => r.argv[1] === 'bot' && !r.argv.includes('--repo')).length
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(full()).toBe(1)
+  for (const step of [180000, 180000]) {
+    await w.clock.advance(step)
+    await $.turn.complete(turnDone(1000))
+    await w.clock.settle()
+  }
+  expect(full()).toBe(1)
+})
+
+test('a per-repository reading that runs out of time falls back to the full one, then waits an hour', async ($, on) => {
+  const w = world(on, { now: 530_000_000, store: { view: 'repo' }, hrn: argv => (argv.includes('--repo') ? cannotStart('timed out') : ran(JSON.stringify(wire))) })
+  const asked = () => w.runs.filter(r => r.argv[1] === 'bot').map(r => r.argv.includes('--repo') ? r.timeoutMs : 'full')
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(asked()).toEqual([8000, 'full'])
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  const all = await texts(ui)
+  expect(all.includes('Delivered here')).toBe(false)
+  await ui.press({ key: 'view-you' })
+  expect((await texts(ui)).includes('Level 9')).toBe(true)
+  await ui.press({ key: 'refresh' })
+  expect(asked()).toEqual([8000, 'full', 'full'])
+  await ui.unmount()
+})
+
+test('runs that stopped without a result are listed as such, never as an empty section', async ($, on) => {
+  const now = 540_000_000
+  const stale = { version: 1, runs: [{ id: 'r0', backend: 'codex', status: 'running', started: new Date(now - 8 * 3600000).toISOString(), duration_ms: 0, repo: '', branch: '' }] }
+  const w = world(on, { now, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(stale)) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    expect((await texts(ui)).includes('codex, stopped without a result, 8 h ago')).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('a kept delivery that cannot be read still leaves the kept stats', async ($, on) => {
+  const stats = parseStats(JSON.stringify(wire)).stats
+  const w = world(on, { now: 550_000_000, store: { view: 'you', stats: { at: 549_000_000, stats, delivery: { name: REPO_NAME, kinds: 'broken' } } }, hrn: () => ran('', 1, 'busy') })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(ui)).includes('Level 9')).toBe(true)
+  await ui.unmount()
+})
+
+test('a kept delivery from an earlier week is not shown', async ($, on) => {
+  const now = Date.parse('2026-11-20T12:00:00Z')
+  const stats = parseStats(JSON.stringify(wire)).stats
+  const lastWeek = Date.parse('2026-11-15T12:00:00Z')
+  const kept = { name: REPO_NAME, week: 545, total: 1820, days: Array(35).fill(1), kinds: [], share: 0.3, top: [] }
+  const w = world(on, { now, store: { view: 'repo', stats: { at: lastWeek, stats, delivery: kept } }, hrn: () => ran('', 1, 'busy') })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(ui)).includes('Delivered here')).toBe(false)
+  await ui.unmount()
+})
+
+test('a runs reading that fails after one that worked hides runs here', async ($, on) => {
+  const now = 560_000_000
+  const cfg: World = { now, store: { view: 'repo' }, hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(runsWire(now))) }
+  const w = world(on, cfg)
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(ui)).includes('Runs here')).toBe(true)
+  cfg.runs = () => ran('', 1, 'hrn: cannot read run records')
+  await w.clock.advance(30000)
+  expect((await texts(ui)).includes('Runs here')).toBe(false)
+  await ui.unmount()
+})
+
+test('the week starts on Monday at midnight UTC, as hrn’s does', () => {
+  expect(new Date(weekStart(Date.parse('2026-11-20T15:00:00Z'))).toISOString()).toBe('2026-11-16T00:00:00.000Z')
+  expect(new Date(weekStart(Date.parse('2026-11-16T00:00:00Z'))).toISOString()).toBe('2026-11-16T00:00:00.000Z')
+  expect(new Date(weekStart(Date.parse('2026-11-22T23:59:59Z'))).toISOString()).toBe('2026-11-16T00:00:00.000Z')
+})
+
 // ---- Privacy ----
 
 test('nothing new reaches the recording file', async ($, on) => {
-  const w = world(on, { now: 250_000_000, git: () => ran(GIT_CHANGED), gh: () => ran(JSON.stringify(PR)), hrn: () => ran(JSON.stringify(wire)) })
+  const w = world(on, { now: 250_000_000, git: () => ran(GIT_CHANGED), gh: () => ran(JSON.stringify(PR)), hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(runsWire(250_000_000))) })
   on('tool.call', () => ({ result: {} }))
   await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
   await $.prompt.submit(typed('secret prompt'))
@@ -764,7 +1108,7 @@ test('nothing new reaches the recording file', async ($, on) => {
     { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'tool', tool: 'Bash', status: 'ok' },
     { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'tool', tool: 'Edit', status: 'ok' },
   ])
-  expect(/secret|pane-look|Pane look|go test/.test([...w.files.values()].join(''))).toBe(false)
+  expect(/secret|pane-look|Pane look|go test|ada-pane|harness|codex|claude,|r1|\.\.\/bad/.test([...w.files.values()].join(''))).toBe(false)
 })
 
 test('records only event metadata and passes results through', async ($, on) => {

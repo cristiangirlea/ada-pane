@@ -2,8 +2,9 @@
 
 Ada's side pane for Claude Code. It opens at session start and on `/ada`, with three views:
 Session (context, plan limit, turn time, a strip of tool calls, the working tree and one
-suggested action), Repo (the branch, its pull request and checks through `gh`, links) and You
-(`hrn bot stats`). The layout is specified in [docs/pane-design.md](docs/pane-design.md).
+suggested action), Repo (the branch, its pull request and checks through `gh`, links, and, with
+an hrn that answers per repository, what was delivered here, its hrn runs and the week's top
+repositories) and You (`hrn bot stats`). The layout is specified in [docs/pane-design.md](docs/pane-design.md).
 
 It records event metadata only (time, session, kind, tool name, ok or error; never prompt or
 command text) to `~/.hrn/claude-sessions/<session>.jsonl` (or under `HRN_HOME`), rotating files

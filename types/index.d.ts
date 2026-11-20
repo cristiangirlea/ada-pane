@@ -53,6 +53,31 @@ export type PrReading =
   /** Any other failure: the section is left out. */
   | { kind: 'hidden' }
 
+/** What `hrn bot stats --json --repo` says of this repository's delivery. */
+export type Delivery = {
+  /** The repository as asked, `owner/name`. */
+  name: string
+  week: number
+  /** The week's delivery in every repository. */
+  total: number
+  /** Delivery per UTC day, oldest first, today last. */
+  days: number[]
+  /** The three kinds with the most events, most first. */
+  kinds: { kind: string; count: number }[]
+  share: number
+  top: { repo: string; week: number }[]
+}
+
+/** One hrn run of this repository, from `hrn runs --json --repo`; never its prompt. */
+export type HrnRun = {
+  id: string
+  backend: string
+  /** `running` while the run has no result. */
+  status: string
+  started: number
+  ms: number
+}
+
 export type AdaState = {
   stats: Stats | null
   /** When the stats were read, in milliseconds; 0 when never. */
@@ -84,6 +109,10 @@ export type AdaState = {
   editedSinceTests: boolean
   git: GitStatus | null
   pr: PrReading
+  /** Null while unknown, or when hrn cannot answer per repository. */
+  delivery: Delivery | null
+  /** Null while unknown, or when hrn cannot list runs per repository. */
+  runs: HrnRun[] | null
 }
 
 declare module 'claude-code' {

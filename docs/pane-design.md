@@ -1,7 +1,8 @@
 # Ada's pane: design spec
 
-Status: slices 1 and 2 are built; slices 3 and 4 wait for hrn (see Order of work). This
-replaces the first redesign's layout (bordered cards, three views) and adds session,
+Status: built. Slices 1, 2 and 4 are in this repository; slice 3 is two hrn additions in
+harness (issues 966 and 967), and the Repo view's hrn sections appear once an hrn built with
+them is installed. `Watch` is not built (see Links). This replaces the first redesign's layout (bordered cards, three views) and adds session,
 repository and delivery readings.
 
 ## Why
@@ -87,7 +88,9 @@ Three buttons: `Session`, `Repo`, `You`; the current one `primary`. The choice i
    - Running now: one line each, backend and how long, at most three.
    - Last five finished: a dot for the result, backend, duration, how long ago.
 4. **Links**, one row: `Repository`, `Pull requests`, `Actions`, and `Watch` (hrn watch's
-   page, when it is running, not on a remote surface).
+   page, when it is running, not on a remote surface). `Watch` is not built: hrn records no
+   address of a running watch, and the port is the person's choice, so the pane cannot tell
+   whether or where one runs.
 5. **Top repositories this week**, last and small: the five with the most delivery XP, this
    one marked. This is the "across projects" reading; a project that groups several
    repositories is in "To decide".
@@ -114,7 +117,7 @@ Three buttons: `Session`, `Repo`, `You`; the current one `primary`. The choice i
 | Pull request, checks, review | `gh pr view --json number,title,state,reviewDecision,statusCheckRollup,closingIssuesReferences` (links are built from the remote, so `url` is not asked for) | state, 2 minutes |
 | Claimed issue | the pull request's closing issues; before one exists, none shown | state |
 | Delivery here, strip, counts, top repositories | hrn, per repository (see below) | `$.store`, with age |
-| Runs here | hrn, per repository (see below) | state, 30 seconds while the view is open |
+| Runs here | hrn, per repository (see below) | state; every 30 seconds while a run is live and the Repo view is on screen |
 | Links | built from `$.session.repo.remote`; only `https://github.com/` remotes get links | none |
 | Game figures | `hrn bot stats --json` | `$.store`, with age |
 
@@ -195,7 +198,7 @@ and `·`. Links work as terminal hyperlinks.
 - Runner detection, including a command that only mentions a runner in an argument.
 - Which action is shown, for each rule and their order.
 - Every state above draws without an error, on desktop and on the terminal.
-- State written by the current build (`ada-2`) is read or reset.
+- State written by earlier builds (`ada-2`, `ada-3`) is read or reset.
 - Nothing new reaches the recording file.
 
 ## Order of work

@@ -1,0 +1,5 @@
+{
+  "name": "ada-pane",
+  "owner": { "name": "cristiangirlea" },
+  "plugins": [{ "name": "ada-pane", "source": "./" }]
+}

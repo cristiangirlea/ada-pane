@@ -51,13 +51,24 @@ export function formatStats(stdout: string): string | undefined {
 let lastRebuild = -Infinity
 let rebuilding = false
 
+async function hrnHome($: EngineInterface) {
+  const home = await $.env.get('HRN_HOME') || ((await $.env.get('HOME') || await $.env.get('USERPROFILE')) + '/.hrn')
+  if (!home || home.startsWith('undefined/')) throw new Error('Home unavailable')
+  return home.replace(/[\\/]+$/, '')
+}
+
 // Only the text form folds new runs into the ledger; run it now and then so the JSON stays current.
+// A stamp in the hrn home keeps it to one rebuild per computer, however many sessions are open.
 async function rebuild($: EngineInterface) {
     try {
       const now = await $.clock.now()
       if (rebuilding || now - lastRebuild < 15 * 60000) return
+      const stamp = `${await hrnHome($)}/claude-sessions/.ledger-rebuild`
+      const last = await $.fs.exists(stamp) ? Number(await $.fs.read(stamp)) : NaN
+      if (Number.isFinite(last) && last <= now && now - last < 15 * 60000) { lastRebuild = last; return }
       rebuilding = true
       lastRebuild = now
+      try { await $.fs.write(stamp, String(now)) } catch { /* Without a stamp this session still rebuilds on its own schedule. */ }
       try { await $.process.run(['hrn', 'bot', 'stats'], { timeoutMs: 120000 }) } catch { /* The next rebuild tries again. */ }
       rebuilding = false
       void refresh($, true)
@@ -82,11 +93,10 @@ async function refresh($: EngineInterface, force = false) {
 export function record($: EngineInterface, entry: { kind: 'prompt' } | { kind: 'tool'; tool: string; status: 'ok' | 'error' }, limit = 1024 * 1024) {
     writes = writes.then(async () => {
       try {
-        const home = await $.env.get('HRN_HOME') || ((await $.env.get('HOME') || await $.env.get('USERPROFILE')) + '/.hrn')
-        if (!home || home.startsWith('undefined/')) throw new Error('Home unavailable')
+        const home = await hrnHome($)
         const session = await $.session.id()
         if (!/^[A-Za-z0-9_-]+$/.test(session)) throw new Error('Invalid session id')
-        const base = `${home.replace(/[\\/]+$/, '')}/claude-sessions/${session}`
+        const base = `${home}/claude-sessions/${session}`
         const time = new Date(await $.clock.now()).toISOString()
         const line = JSON.stringify({ time, session, ...entry }) + '\n'
         const bytes = (text: string) => new TextEncoder().encode(text).length

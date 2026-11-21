@@ -1,7 +1,13 @@
 # ada-pane
 
-Ada's side pane for Claude Code. It opens at session start and on `/ada`, shows `hrn bot stats`
-(refreshed every minute), counts prompts and tool calls, and reacts to each one.
+Ada's side pane for Claude Code. It opens at session start and on `/ada`, shows
+`hrn bot stats --json` (refreshed every minute), counts prompts and tool calls, and reacts to
+each one.
+
+The JSON form reads the game ledger without folding new runs in, so the pane also runs the slower
+`hrn bot stats` in the background, at most once every 15 minutes per computer, which can take a
+minute and calls GitHub through `gh`. The stamp `claude-sessions/.ledger-rebuild` in the hrn
+home keeps open sessions from repeating it.
 
 It records event metadata only (time, session, kind, tool name, ok or error; never prompt or
 command text) to `~/.hrn/claude-sessions/<session>.jsonl` (or under `HRN_HOME`), rotating files

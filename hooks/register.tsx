@@ -16,22 +16,53 @@ async function change($: EngineInterface, fn: (s: AdaState) => AdaState) {
     try { await update($, pane, fn) } catch { /* Observation must not affect the session. */ }
   }
 const count = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']
+// Ledger keys become badge names, so control characters and length are cut before drawing.
+const clean = (text: string) => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 40)
+
+function weekStart(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return undefined
+  const date = new Date(`${value}T00:00:00Z`)
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) return undefined
+  return `${days[date.getUTCDay()]} ${date.getUTCDate()} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}`
+}
 
 // The JSON form skips the ledger rebuild that makes the text form too slow for a pane.
 export function formatStats(stdout: string): string | undefined {
   let s: any
   try { s = JSON.parse(stdout) } catch { return undefined }
-  if (!s || typeof s !== 'object') return undefined
+  if (!s || typeof s !== 'object' || s.version !== 1) return undefined
   if (s.enabled === false) return 'The game is off; the ledger keeps recording.'
   if (!count(s.level) || !count(s.xp)) return undefined
   const lines = [`level ${s.level}, ${s.xp} xp (${Math.max(0, 50 * (s.level + 1) ** 2 - s.xp)} more for level ${s.level + 1})`]
   if (count(s.streak)) lines.push(`streak: ${s.streak} days`)
-  if (s.week && count(s.week.delivery) && count(s.week.practice)) lines.push(`this week: delivery ${s.week.delivery} xp, practice ${s.week.practice} xp`)
+  if (s.week && count(s.week.delivery) && count(s.week.practice)) {
+    const from = weekStart(s.week_start)
+    lines.push(`this week${from ? `, from ${from} UTC` : ''}: delivery ${s.week.delivery} xp, practice ${s.week.practice} xp`)
+  }
   if (s.ada && count(s.ada.level) && count(s.ada.xp_this_week)) lines.push(`Ada: level ${s.ada.level}, ${s.ada.xp_this_week} xp this week`)
-  const badges = Array.isArray(s.badges) ? s.badges.filter((b: unknown) => typeof b === 'string') : []
-  if (badges.length) lines.push(`badges: ${badges.join(', ')}`)
+  const badges: string[] = Array.isArray(s.badges) ? s.badges.filter((b: unknown) => typeof b === 'string').map(clean).filter(Boolean) : []
+  const shown = badges.slice(0, 10).join(', ') + (badges.length > 10 ? `, +${badges.length - 10} more` : '')
+  lines.push(`badges: ${badges.length ? shown : 'none yet'}`)
   return lines.join('\n')
 }
+
+let lastRebuild = -Infinity
+let rebuilding = false
+
+// Only the text form folds new runs into the ledger; run it now and then so the JSON stays current.
+async function rebuild($: EngineInterface) {
+    try {
+      const now = await $.clock.now()
+      if (rebuilding || now - lastRebuild < 15 * 60000) return
+      rebuilding = true
+      lastRebuild = now
+      try { await $.process.run(['hrn', 'bot', 'stats'], { timeoutMs: 120000 }) } catch { /* The next rebuild tries again. */ }
+      rebuilding = false
+      void refresh($, true)
+    } catch { rebuilding = false }
+  }
 
 async function refresh($: EngineInterface, force = false) {
     try {
@@ -86,7 +117,8 @@ export const register: Register = on => {
     try { await $.command.register({ name: 'ada', description: 'Open Ada’s session pane' }) } catch {}
     try { void $.ui.open({ id: 'ada', title: 'Ada' }).catch(() => {}) } catch {}
     void refresh($)
-    try { $.clock.every(60000, () => { void refresh($) }) } catch {}
+    void rebuild($)
+    try { $.clock.every(60000, () => { void refresh($); void rebuild($) }) } catch {}
     return result
   })
   on('command.run', { command: 'ada' }, async ($) => {

@@ -119,13 +119,87 @@ test('formats the JSON stats like the text form', async () => {
   expect(formatStats(sample)).toBe([
     'level 9, 4300 xp (700 more for level 10)',
     'streak: 2 days',
-    'this week: delivery 605 xp, practice 0 xp',
+    'this week, from Monday 16 November 2026 UTC: delivery 605 xp, practice 0 xp',
     'Ada: level 2, 30 xp this week',
     'badges: Budget keeper, Cheap and right',
   ].join('\n'))
-  expect(formatStats('{"enabled":false}')).toBe('The game is off; the ledger keeps recording.')
+  expect(formatStats('{"version":1,"enabled":false}')).toBe('The game is off; the ledger keeps recording.')
+  expect(formatStats('{"version":2,"enabled":true,"level":9,"xp":4300}')).toBe(undefined)
   expect(formatStats('not json')).toBe(undefined)
   expect(formatStats('null')).toBe(undefined)
-  expect(formatStats('{"level":-1,"xp":5}')).toBe(undefined)
-  expect(formatStats('{"level":"9","xp":5}')).toBe(undefined)
+  expect(formatStats('{"version":1,"level":-1,"xp":5}')).toBe(undefined)
+  expect(formatStats('{"version":1,"level":"9","xp":5}')).toBe(undefined)
+})
+
+const stats = (extra: object) => formatStats(JSON.stringify({ version: 1, enabled: true, level: 0, xp: 10, ...extra }))!.split('\n')
+
+test('leaves out what the JSON lacks and cleans badge names', async () => {
+  expect(stats({ streak: null, week_start: 'nope', week: { delivery: 1, practice: 2 } })).toEqual([
+    'level 0, 10 xp (40 more for level 1)', 'this week: delivery 1 xp, practice 2 xp', 'badges: none yet',
+  ])
+  expect(stats({ badges: [7, null, 'Real one', '\u0007'] })).toContain('badges: Real one')
+  const long = stats({ badges: ['\u001b[31mred\u001b[0m' + 'x'.repeat(60), ...Array.from({ length: 11 }, (_, i) => `b${i}`)] })
+  const line = long.find(l => l.startsWith('badges: '))!
+  expect(line.includes('\u001b')).toBe(false)
+  expect(line.startsWith('badges: [31mred[0m' + 'x'.repeat(30) + ', b0')).toBe(true)
+  expect(line.endsWith(', +2 more')).toBe(true)
+})
+
+const ran = (exitCode: number, stdout: string, isStdoutTruncated = false) =>
+  ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated, isStderrTruncated: false } })
+
+test('a failed, truncated or timed out run shows the unavailable line', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  on('ui.open', { id: 'ada' }, () => ({ value: { isPlaced: true } }))
+  const answers: (() => ReturnType<typeof ran>)[] = [
+    () => ran(0, sample),
+    () => ran(1, sample),
+    () => ran(0, sample, true),
+    () => { throw new Error('timed out') },
+    () => ran(0, sample),
+  ]
+  let calls = 0
+  on('process.run', () => answers[calls++]!())
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  const first = async () => (await ui.drawn() as any).children[0].children.join('')
+  const shown: string[] = []
+  for (let i = 0; i < answers.length; i++) {
+    await $.command.run(ada)
+    await clock.settle()
+    shown.push(await first())
+  }
+  expect(calls).toBe(5)
+  expect(shown.map(t => t === 'hrn bot stats unavailable')).toEqual([false, true, true, true, false])
+  await ui.unmount()
+})
+
+test('a refresh already running is not started twice', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  on('ui.open', { id: 'ada' }, () => ({ value: { isPlaced: true } }))
+  let calls = 0
+  on('process.run', async () => { calls++; await clock.advance(10); return ran(0, sample) })
+  await $.command.run(ada)
+  await $.command.run(ada)
+  await clock.advance(20)
+  expect(calls).toBe(1)
+})
+
+test('session start rebuilds the ledger in the background, then redraws from the JSON', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  const argv: string[] = []
+  on('process.run', (_, e) => {
+    argv.push(`${e.argv.join(' ')} ${e.init?.timeoutMs}`)
+    return e.argv.includes('--json') ? ran(0, sample) : ran(0, 'text')
+  })
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(argv).toContain('hrn bot stats 120000')
+  expect(argv.at(-1)).toBe('hrn bot stats --json 30000')
+  const count = argv.length
+  await clock.advance(60000)
+  expect(argv.filter(a => a === 'hrn bot stats 120000').length).toBe(1)
+  await clock.advance(15 * 60000)
+  expect(argv.filter(a => a === 'hrn bot stats 120000').length).toBe(2)
+  expect(argv.length > count).toBe(true)
 })

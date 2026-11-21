@@ -15,6 +15,24 @@ let writes = Promise.resolve()
 async function change($: EngineInterface, fn: (s: AdaState) => AdaState) {
     try { await update($, pane, fn) } catch { /* Observation must not affect the session. */ }
   }
+const count = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0
+
+// The JSON form skips the ledger rebuild that makes the text form too slow for a pane.
+export function formatStats(stdout: string): string | undefined {
+  let s: any
+  try { s = JSON.parse(stdout) } catch { return undefined }
+  if (!s || typeof s !== 'object') return undefined
+  if (s.enabled === false) return 'The game is off; the ledger keeps recording.'
+  if (!count(s.level) || !count(s.xp)) return undefined
+  const lines = [`level ${s.level}, ${s.xp} xp (${Math.max(0, 50 * (s.level + 1) ** 2 - s.xp)} more for level ${s.level + 1})`]
+  if (count(s.streak)) lines.push(`streak: ${s.streak} days`)
+  if (s.week && count(s.week.delivery) && count(s.week.practice)) lines.push(`this week: delivery ${s.week.delivery} xp, practice ${s.week.practice} xp`)
+  if (s.ada && count(s.ada.level) && count(s.ada.xp_this_week)) lines.push(`Ada: level ${s.ada.level}, ${s.ada.xp_this_week} xp this week`)
+  const badges = Array.isArray(s.badges) ? s.badges.filter((b: unknown) => typeof b === 'string') : []
+  if (badges.length) lines.push(`badges: ${badges.join(', ')}`)
+  return lines.join('\n')
+}
+
 async function refresh($: EngineInterface, force = false) {
     try {
       const now = await $.clock.now()
@@ -23,8 +41,8 @@ async function refresh($: EngineInterface, force = false) {
       lastRefresh = now
       let stats = 'hrn bot stats unavailable'
       try {
-        const result = await $.process.run(['hrn', 'bot', 'stats'], { timeoutMs: 5000 })
-        if (result.exitCode === 0 && !result.isStdoutTruncated && result.stdout.trim()) stats = result.stdout.trim()
+        const result = await $.process.run(['hrn', 'bot', 'stats', '--json'], { timeoutMs: 30000 })
+        if (result.exitCode === 0 && !result.isStdoutTruncated) stats = formatStats(result.stdout) ?? stats
       } catch { /* Use the unavailable line. */ }
       await change($, s => ({ ...s, stats }))
       refreshing = false

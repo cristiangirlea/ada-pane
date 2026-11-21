@@ -1,11 +1,12 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { record } from './register'
+import { formatStats, record } from './register'
 import type { EngineInterface } from 'claude-code'
 
 const pane = { plugin: 'ada-pane', component: 'Pane', requestId: 'ada', props: {
   title: 'Ada', isFocused: false, bodyColumns: 40, placement: 'dock',
   scroll: { offset: 0, bodyRows: 20 }, view: {},
 } } as const
+const ada = { command: 'ada', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 80 } } as const
 
 test('records only event metadata and passes results through', async ($, on) => {
   mock.env(on, { HRN_HOME: '/hrn' })
@@ -18,7 +19,7 @@ test('records only event metadata and passes results through', async ($, on) => 
   on('fs.write', (_, e) => { path = e.path; content = e.text; return { value: undefined } })
   on('prompt.submit', (_, e) => ({ text: e.text }))
   on('tool.call', () => ({ result: {}, isError: true }))
-  const prompt = await $.prompt.submit({ text: 'secret prompt' })
+  const prompt = await $.prompt.submit({ text: 'secret prompt', wait: false, origin: { kind: 'composer' } })
   const tool = await $.tool.call({ tool: 'Bash', command: 'secret command' })
   expect(prompt.text).toBe('secret prompt')
   expect(tool.isError).toBe(true)
@@ -38,7 +39,7 @@ test('draws Ada state on both surfaces and updates after events', async ($, on) 
   on('fs.write', () => ({ value: undefined }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
   on('tool.call', () => ({ result: {}, isError: true }))
-  await $.prompt.submit({ text: 'hello' })
+  await $.prompt.submit({ text: 'hello', wait: false, origin: { kind: 'composer' } })
   await $.tool.call({ tool: 'Bash', command: 'false' })
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...pane, surface })
@@ -74,8 +75,25 @@ test('serializes records and rotates before exceeding the byte limit', async () 
   expect([...files.values()].flatMap(value => value.trim().split('\n').map(line => JSON.parse(line).kind))).toEqual(['tool', 'prompt', 'prompt'])
 })
 
+test('refresh reads the JSON form with a 30 second limit and draws it', async ($, on) => {
+  const clock = mock.clock(on, { now: 0 })
+  const calls: { argv: readonly string[]; timeoutMs?: number }[] = []
+  on('process.run', (_, e) => {
+    calls.push({ argv: e.argv, timeoutMs: e.init?.timeoutMs })
+    return { value: { exitCode: 0, stdout: sample, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+  on('ui.open', { id: 'ada' }, () => ({ value: { isPlaced: true } }))
+  await $.command.run(ada)
+  await clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  const line = (await ui.find({ type: 'Text', text: /level 9, 4300 xp/ }))?.text
+  expect(calls[0]).toEqual({ argv: ['hrn', 'bot', 'stats', '--json'], timeoutMs: 30000 })
+  expect(line?.startsWith('level 9, 4300 xp (700 more for level 10)')).toBe(true)
+  await ui.unmount()
+})
+
 test('/ada answers itself and opens the pane', async ($, on) => {
-  mock.clock(on, { now: 0 })
+  const clock = mock.clock(on, { now: 0 })
   on('process.run', () => ({ value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }))
   let opened = 0
   let placed = true
@@ -83,10 +101,31 @@ test('/ada answers itself and opens the pane', async ($, on) => {
     opened++
     return { value: placed ? { isPlaced: true } : { isPlaced: false, reason: 'no surface' } }
   })
-  const open = await $.command.run({ command: 'ada' })
+  const open = await $.command.run(ada)
   expect(open.text).toBe('Ada’s pane is open.')
   expect(opened).toBe(1)
   placed = false
-  const waiting = await $.command.run({ command: 'ada' })
+  const waiting = await $.command.run(ada)
   expect(waiting.text).toBe('Ada’s pane is waiting for a place to draw: no surface')
+  await clock.settle()
+})
+
+const sample = JSON.stringify({
+  version: 1, enabled: true, level: 9, xp: 4300, week_start: '2026-11-16', week: { delivery: 605, practice: 0 },
+  streak: 2, badges: ['Budget keeper', 'Cheap and right'], ada: { level: 2, xp_this_week: 30, xp: 370 },
+})
+
+test('formats the JSON stats like the text form', async () => {
+  expect(formatStats(sample)).toBe([
+    'level 9, 4300 xp (700 more for level 10)',
+    'streak: 2 days',
+    'this week: delivery 605 xp, practice 0 xp',
+    'Ada: level 2, 30 xp this week',
+    'badges: Budget keeper, Cheap and right',
+  ].join('\n'))
+  expect(formatStats('{"enabled":false}')).toBe('The game is off; the ledger keeps recording.')
+  expect(formatStats('not json')).toBe(undefined)
+  expect(formatStats('null')).toBe(undefined)
+  expect(formatStats('{"level":-1,"xp":5}')).toBe(undefined)
+  expect(formatStats('{"level":"9","xp":5}')).toBe(undefined)
 })

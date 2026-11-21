@@ -191,7 +191,10 @@ async function startSession($: any, on: any, now: number, files: Map<string, str
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
   const key = (path: string) => path.replace(/\\/g, '/').replace(/^.*?(\/hrn\/)/, '$1')
   on('fs.exists', (_: unknown, e: { path: string }) => ({ value: files.has(key(e.path)) }))
-  on('fs.read', (_: unknown, e: { path: string }) => ({ value: files.get(key(e.path)) ?? '' }))
+  on('fs.read', (_: unknown, e: { path: string }) => {
+    if (files.get(key(e.path)) === 'unreadable') throw new Error('permission denied')
+    return { value: files.get(key(e.path)) ?? '' }
+  })
   on('fs.write', (_: unknown, e: { path: string; text: string }) => { files.set(key(e.path), e.text); return { value: undefined } })
   const argv: string[] = []
   on('process.run', (_: unknown, e: { argv: readonly string[]; init?: { timeoutMs?: number } }) => {
@@ -227,6 +230,13 @@ test('a recent rebuild by another session is not repeated', async ($, on) => {
   expect(rebuilds()).toBe(0)
   await clock.advance(6 * 60000)
   expect(rebuilds()).toBe(1)
+})
+
+test('an unreadable stamp does not stop rebuilds', async ($, on) => {
+  const files = new Map([[stamp, 'unreadable']])
+  const { rebuilds } = await startSession($, on, 2.5e9, files)
+  expect(rebuilds()).toBe(1)
+  expect(files.get(stamp)).toBe(String(2.5e9))
 })
 
 for (const [name, exit, now] of [['fails', 1, 3e9], ['times out', -1, 4e9]] as const) {

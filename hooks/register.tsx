@@ -64,7 +64,8 @@ async function rebuild($: EngineInterface) {
       const now = await $.clock.now()
       if (rebuilding || now - lastRebuild < 15 * 60000) return
       const stamp = `${await hrnHome($)}/claude-sessions/.ledger-rebuild`
-      const last = await $.fs.exists(stamp) ? Number(await $.fs.read(stamp)) : NaN
+      let last = NaN
+      try { if (await $.fs.exists(stamp)) last = Number(await $.fs.read(stamp)) } catch { /* An unreadable stamp must not stop rebuilds. */ }
       if (Number.isFinite(last) && last <= now && now - last < 15 * 60000) { lastRebuild = last; return }
       rebuilding = true
       lastRebuild = now

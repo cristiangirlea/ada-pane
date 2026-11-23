@@ -121,7 +121,7 @@ Three buttons: `Session`, `Repo`, `You`; the current one `primary`. The choice i
 | Delivery here, strip, counts, top repositories | hrn, per repository (see below) | `$.store`, with age |
 | Runs here | hrn, per repository (see below) | state; every 30 seconds while a run is live and the Repo view is on screen |
 | Links | built from `$.session.repo.remote`; only `https://github.com/` remotes get links. `Watch`: the `watch_address` option, asked over loopback | the address that answered, state |
-| Game figures | `hrn bot stats --json` | `$.store`, with age |
+| Game figures | `hrn bot stats --json`; the ledger it reads is kept current by the text form `hrn bot stats` (see Cost) | `$.store`, with age |
 
 ### What hrn has to give first
 
@@ -143,7 +143,9 @@ hrn sections out, without an error.
 
 - Recording to `~/.hrn/claude-sessions` does not change: event metadata only.
 - New readings live in the session's state and are never written to a file. The test check
-  looks at a command's first words to name the runner and keeps the runner's name only.
+  looks at a command's first words to name the runner and keeps the runner's name only. The one
+  file the pane writes besides the recording is `claude-sessions/.ledger-rebuild` in the hrn
+  home, which holds a time and nothing else.
 - Links are built from the repository's own remote, and `Watch` from the person's own
   loopback address; nothing from a tool's output or a web page becomes a link.
 - `gh` and `git` are called read-only, with fixed arguments.
@@ -159,6 +161,9 @@ hrn sections out, without an error.
 - hrn's per-repository answers: as `gh`, plus runs every 30 seconds while a run is live.
 - The watch address: as `gh`, with a two-second limit, and only while a terminal shows the
   pane in a repository with a GitHub remote.
+- The ledger rebuild (`hrn bot stats`, the text form, which folds new runs into the ledger the
+  JSON form reads): when a session starts and after a turn ends, at most once in 15 minutes per
+  computer (a time stamp in the hrn home), two-minute limit, followed by one JSON reading.
 - No timer redraws the pane while idle. A running turn ticks once a second.
 - Any of these failing hides its section; the pane shows no error for it.
 

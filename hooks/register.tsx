@@ -26,6 +26,9 @@ const RUNS_LIVE_EVERY_MS = 30000
 const STALE_RUN_MS = 6 * 3600000
 // How long to remember that the installed hrn refused a newer flag before asking again.
 const FLAG_RETRY_MS = 3600000
+// The text form folds new runs into the ledger the JSON form reads; it can take a minute.
+const REBUILD_EVERY_MS = 15 * 60000
+const REBUILD_TIMEOUT_MS = 120000
 const GIT_TIMEOUT_MS = 3000
 const GIT_EVERY_MS = 10000
 const PR_TIMEOUT_MS = 8000
@@ -44,6 +47,8 @@ const FILE_WRITERS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit'])
 
 let lastRefresh = -Infinity
 let statsBusy = false
+let lastRebuild = -Infinity
+let rebuilding = false
 let writes = Promise.resolve()
 let ticker: Timer | null = null
 let gitAt = -Infinity
@@ -230,37 +235,61 @@ const toWire = (s: Stats) => ({
   ada: s.ada && { level: s.ada.level, xp_this_week: s.ada.xpThisWeek }, exercise: s.exercise,
 })
 
-export function record($: EngineInterface, entry: { kind: 'prompt' } | { kind: 'tool'; tool: string; status: 'ok' | 'error' }, limit = 1024 * 1024) {
-  writes = writes.then(async () => {
-    try {
-      const home = await $.env.get('HRN_HOME') || ((await $.env.get('HOME') || await $.env.get('USERPROFILE')) + '/.hrn')
-      if (!home || home.startsWith('undefined/')) throw new Error('Home unavailable')
-      const session = await $.session.id()
-      if (!/^[A-Za-z0-9_-]+$/.test(session)) throw new Error('Invalid session id')
-      const base = `${home.replace(/[\\/]+$/, '')}/claude-sessions/${session}`
-      const time = new Date(await $.clock.now()).toISOString()
-      const line = JSON.stringify({ time, session, ...entry }) + '\n'
-      const bytes = (text: string) => new TextEncoder().encode(text).length
-      if (bytes(line) > limit) throw new Error('Record exceeds file limit')
-      let number = 1
-      let path = `${base}.jsonl`
-      let previous = ''
-      while (await $.fs.exists(path)) {
-        previous = await $.fs.read(path)
-        const nextPath = `${base}.${number + 1}.jsonl`
-        if (!await $.fs.exists(nextPath)) break
-        path = nextPath
-        number++
-      }
-      if (bytes(previous) + bytes(line) > limit) {
-        path = `${base}.${number + 1}.jsonl`
-        previous = ''
-      }
-      await $.fs.write(path, previous + line)
-    } catch { await change($, s => ({ ...s, recordingFailed: true })) }
-  })
-  return writes
+async function hrnHome($: EngineInterface) {
+  const home = await $.env.get('HRN_HOME') || ((await $.env.get('HOME') || await $.env.get('USERPROFILE')) + '/.hrn')
+  if (!home || home.startsWith('undefined/')) throw new Error('Home unavailable')
+  return home.replace(/[\\/]+$/, '')
 }
+
+// Only the text form folds new runs into the ledger; run it now and then so the JSON stays current.
+// A stamp in the hrn home keeps it to one rebuild per computer, however many sessions are open.
+async function rebuild($: EngineInterface) {
+  try {
+    const now = await $.clock.now()
+    if (rebuilding || tooSoon(now, lastRebuild, REBUILD_EVERY_MS)) return
+    const stamp = `${await hrnHome($)}/claude-sessions/.ledger-rebuild`
+    let last = NaN
+    try { if (await $.fs.exists(stamp)) last = Number(await $.fs.read(stamp)) } catch { /* An unreadable stamp must not stop rebuilds. */ }
+    if (Number.isFinite(last) && last <= now && now - last < REBUILD_EVERY_MS) { lastRebuild = last; return }
+    rebuilding = true
+    lastRebuild = now
+    try { await $.fs.write(stamp, String(now)) } catch { /* Without a stamp this session still rebuilds on its own schedule. */ }
+    try { await $.process.run(['hrn', 'bot', 'stats'], { timeoutMs: REBUILD_TIMEOUT_MS }) } catch { /* The next rebuild tries again. */ }
+    rebuilding = false
+    void refresh($, true)
+  } catch { rebuilding = false }
+}
+
+export function record($: EngineInterface, entry: { kind: 'prompt' } | { kind: 'tool'; tool: string; status: 'ok' | 'error' }, limit = 1024 * 1024) {
+    writes = writes.then(async () => {
+      try {
+        const home = await hrnHome($)
+        const session = await $.session.id()
+        if (!/^[A-Za-z0-9_-]+$/.test(session)) throw new Error('Invalid session id')
+        const base = `${home}/claude-sessions/${session}`
+        const time = new Date(await $.clock.now()).toISOString()
+        const line = JSON.stringify({ time, session, ...entry }) + '\n'
+        const bytes = (text: string) => new TextEncoder().encode(text).length
+        if (bytes(line) > limit) throw new Error('Record exceeds file limit')
+        let number = 1
+        let path = `${base}.jsonl`
+        let previous = ''
+        while (await $.fs.exists(path)) {
+          previous = await $.fs.read(path)
+          const nextPath = `${base}.${number + 1}.jsonl`
+          if (!await $.fs.exists(nextPath)) break
+          path = nextPath
+          number++
+        }
+        if (bytes(previous) + bytes(line) > limit) {
+          path = `${base}.${number + 1}.jsonl`
+          previous = ''
+        }
+        await $.fs.write(path, previous + line)
+      } catch { await change($, s => ({ ...s, recordingFailed: true })) }
+    })
+    return writes
+  }
 
 // ---- Readings ----
 
@@ -743,6 +772,7 @@ export const register: Register = (on, options) => {
       await refreshGit($)
       await refreshRepo($)
       await refresh($)
+      await rebuild($)
     })
     return result
   })
@@ -808,7 +838,7 @@ export const register: Register = (on, options) => {
       ...(e.isAborted ? { reaction: 'Stopped. Over to you.', mood: 'idle' as const }
         : s.mood === 'busy' ? { reaction: 'Done. What’s next?', mood: 'idle' as const } : {}),
     }))
-    void refreshGit($).then(() => refreshRepo($)).then(() => refresh($))
+    void refreshGit($).then(() => refreshRepo($)).then(() => refresh($)).then(() => rebuild($))
     return result
   })
   on('ui.render', { component: 'Pane', requestId: 'ada' }, async ($, e) => {

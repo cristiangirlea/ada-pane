@@ -5,7 +5,13 @@ Session (context, plan limit, turn time, a strip of tool calls, the working tree
 suggested action), Repo (the branch, its pull request and checks through `gh`, links, and, with
 an hrn that answers per repository, what was delivered here, its hrn runs and the week's top
 repositories) and You (`hrn bot stats`). In the terminal, the Repo view also links to a running
-`hrn watch`, at the address in the mod's `watch_address` option (default `127.0.0.1:8089`). The layout is specified in [docs/pane-design.md](docs/pane-design.md).
+`hrn watch`, at the address in the mod's `watch_address` option (default `127.0.0.1:8089`).
+The layout is specified in [docs/pane-design.md](docs/pane-design.md).
+
+The JSON form reads the game ledger without folding new runs in, so the pane also runs the slower
+`hrn bot stats` in the background when a session starts and when a turn ends, at most once every
+15 minutes per computer, which can take a minute and calls GitHub through `gh`. The stamp
+`claude-sessions/.ledger-rebuild` in the hrn home keeps open sessions from repeating it.
 
 It records event metadata only (time, session, kind, tool name, ok or error; never prompt or
 command text) to `~/.hrn/claude-sessions/<session>.jsonl` (or under `HRN_HOME`), rotating files

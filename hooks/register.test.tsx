@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import {
   age, barHeights, deliveryStrip, isLive, kindLine, parseDelivery, parseRuns, watchPage, weekStart, blockRuns, checkState, chooseAction, contextPercent, dayGrid, duration, githubRepo, levelSpan, macaw,
-  parseGitStatus, parsePullRequest, parseStats, percentText, planFigure, pushCall, readPullRequest, readPullRequestFailure,
+  parseGitStatus, parsePullRequest, parseStats, svgSize, percentText, planFigure, pushCall, readPullRequest, readPullRequestFailure,
   record, repoLinks, resetsIn, ring, stopwatch, strip, testRunner, tokenCount,
 } from './register'
 import type { EngineInterface, On, SessionUsage } from 'claude-code'
@@ -1310,6 +1310,18 @@ test('no timer rebuilds the ledger while the session is idle', async ($, on) => 
   await w.clock.settle()
   await w.clock.advance(60 * 60000)
   expect(w.runs.filter(r => isRebuild(r.argv)).length).toBe(1)
+})
+
+test('every picture is drawn at the size its markup declares, so the strip stays a thin row', async ($, on) => {
+  world(on, { now: 740_000_000, repo: null })
+  on('tool.call', () => ({ result: {} }))
+  await $.tool.call({ tool: 'Read', file_path: '/a' })
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  const sizes = (await ui.findAll({ type: 'Svg' })).map(x => [String(x.props.alt).split(',')[0], x.props.width, x.props.height])
+  expect(sizes).toEqual([['Ada', 46, 46], ['The last 1 tool calls', 238, 28]])
+  await ui.unmount()
+  expect(svgSize('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10" width="10" height="4"><rect width="99" height="99"/></svg>')).toEqual([10, 4])
+  expect(svgSize('<svg viewBox="0 0 10 10"></svg>')).toEqual([undefined, undefined])
 })
 
 // ---- Privacy ----

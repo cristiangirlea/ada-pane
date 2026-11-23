@@ -609,6 +609,16 @@ export function kindLine(kind: string, count: number) {
   return `${grouped(count)} ${count === 1 ? one : many}`
 }
 
+/** The width and height a drawing's root element declares, so it is drawn at its own size. */
+export function svgSize(source: string): [number | undefined, number | undefined] {
+  const root = /^<svg\b[^>]*>/.exec(source)?.[0] ?? ''
+  const read = (name: string) => {
+    const v = Number(new RegExp(`\\s${name}="(\\d+)"`).exec(root)?.[1])
+    return Number.isFinite(v) && v > 0 ? v : undefined
+  }
+  return [read('width'), read('height')]
+}
+
 /** The last 35 days as a grid of weeks, a filled square for a day with practice. */
 export function dayGrid(days: boolean[]) {
   const cells = days.slice(-35)
@@ -852,7 +862,9 @@ export const register: Register = (on, options) => {
     const picture = (source: string, alt: string) => {
       if (e.surface === 'terminal') return null
       const { Svg } = $.ui.resolve(e)
-      return <Svg source={source} alt={alt} />
+      // Without a size the surface widens a drawing to its slot; thin bars must stay thin.
+      const [width, height] = svgSize(source)
+      return <Svg source={source} alt={alt} width={width} height={height} />
     }
     const view: AdaView = state.view === 'repo' && !repo ? 'session' : state.view
     const show = (next: AdaView) => () => {

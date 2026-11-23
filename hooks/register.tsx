@@ -1,18 +1,23 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, ProcessRunResult, Register, RenderChildren, SessionUsage, Timer } from 'claude-code'
-import type { AdaState, AdaView, CheckState, Delivery, GitStatus, HrnRun, PrReading, PullRequest, Stats, TestRun, ToolBar } from '../types'
+import type { AdaState, AdaView, CheckState, ContextPart, Delivery, GitStatus, HrnRun, PrReading, PullRequest, Stats, Step, TestRun, Tokens, ToolBar } from '../types'
+
+const NO_TOKENS: Tokens = { fresh: 0, cached: 0, written: 0, out: 0 }
 
 const initial: AdaState = {
   stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'session',
   reaction: 'Ready when you are.', mood: 'idle', recordingFailed: false,
   lastTool: '', lastToolAt: 0, lastStatus: '', running: 0,
   calls: [], callCount: 0, failedCount: 0, slowest: null,
-  turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null,
+  turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null, loopCalls: 0, loopTool: '', loopRunning: 0,
+  stage: 'idle', model: '', effort: '', steps: [], stepCount: 0,
+  turnTokens: NO_TOKENS, sessionTokens: NO_TOKENS, helperTokens: NO_TOKENS, helpersStarted: 0,
+  toolCounts: [], handoffs: { sent: 0, running: 0, back: 0, failed: 0, backends: [] }, contextParts: null,
   tests: null, editedSinceTests: false, git: null, pr: { kind: 'unknown' }, delivery: null, runs: null,
 }
 
 // The tag declines what a version with other fields stored.
-const pane = atom({ plugin: 'ada-pane', key: 'pane' } as const, initial, { shape: 'ada-4' })
+const pane = atom({ plugin: 'ada-pane', key: 'pane' } as const, initial, { shape: 'ada-5' })
 
 // hrn reads every run record: a first answer has taken over a minute.
 const STATS_ARGS = ['hrn', 'bot', 'stats', '--json'] as const
@@ -34,11 +39,22 @@ const GIT_EVERY_MS = 10000
 const PR_TIMEOUT_MS = 8000
 const PR_EVERY_MS = 120000
 const STRIP_CALLS = 40
+const STEPS_KEPT = 8
+const TOOLS_KEPT = 24
+// The breakdown is estimated locally and sends nothing, but it is still work: once a minute at most.
+const CONTEXT_EVERY_MS = 60000
 
 const SCARLET = '#D85A30'
 const UNFILLED = '#8a94a3'
 const OK_FILL = '#2a9d6a'
 const FAILED_FILL = '#d64545'
+const FRESH_FILL = '#4a7fd4'
+const WRITTEN_FILL = '#d9a23b'
+// Mid-tones that hold on light and dark, one per part of the context, largest first.
+const PART_FILLS = ['#4a7fd4', '#8b6fd6', '#d9a23b', '#2a9d9d', '#c9577c', '#7d8794']
+// A station's fill carries white text on either theme.
+const STATION_FILL = { now: '#C24A22', done: '#23805a', idle: '#6b7785' } as const
+const HOLLOW_TEXT = '#7d8794'
 
 // No optional locks: a status read must never hold the index lock the agent's own git needs.
 const GIT_ARGS = ['git', '--no-optional-locks', 'status', '--porcelain=v2', '--branch'] as const
@@ -62,6 +78,10 @@ let runsAt = -Infinity
 let runsBusy = false
 let runsRefusedAt = -Infinity
 let runsLater: Timer | null = null
+let contextAt = -Infinity
+let contextBusy = false
+// Loops the engine lists as helpers; its own forks (a compaction, a memory pass) carry ids it never lists.
+const helperIds = new Set<string>()
 let watchAt = -Infinity
 let watchBusy = false
 // Set from the plugin's options at register; null when the option names no loopback address.
@@ -150,7 +170,7 @@ async function refresh($: EngineInterface, force = false, every = STATS_EVERY_MS
 async function recall($: EngineInterface) {
   try {
     const view = await $.store.get('view')
-    if (view === 'session' || view === 'repo' || view === 'you') await change($, s => ({ ...s, view }))
+    if (view === 'session' || view === 'agent' || view === 'repo' || view === 'you') await change($, s => ({ ...s, view }))
   } catch { /* Session is the default. */ }
   try {
     const kept = await $.store.get('stats') as { at?: unknown; stats?: unknown; delivery?: unknown } | null | undefined
@@ -407,12 +427,15 @@ const RUNNERS: [RegExp, string][] = [
 
 /** The test runner a command starts, by its first words; a runner named later is an argument. */
 export function testRunner(command: string): string | null {
-  const rest = command.trim()
-    .replace(/^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*&&\s*/, '')
-    .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '')
+  const rest = program(command)
   for (const [pattern, name] of RUNNERS) if (pattern.test(rest)) return name
   return null
 }
+
+/** A command from the program it starts, past a leading `cd … &&` and variable settings. */
+const program = (command: string) => command.trim()
+  .replace(/^cd\s+(?:"[^"]*"|'[^']*'|\S+)\s*&&\s*/, '')
+  .replace(/^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"[^"]*"|'[^']*'|\S*)\s+)+/, '')
 
 export type Action = { key: 'ask-why' | 'compact' | 'rerun'; label: string; text: string }
 
@@ -427,6 +450,128 @@ export function chooseAction(s: Pick<AdaState, 'lastStatus' | 'tests' | 'editedS
   }
   return null
 }
+
+// ---- The agent's loop ----
+
+/** A tool's name as the pane prints it: an MCP tool by its own name, without its server. */
+export function shortTool(name: string) {
+  const own = name.startsWith('mcp__') ? name.split('__').slice(2).join('__') || name : name
+  return own.replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 24) || 'tool'
+}
+
+/** How a response ended, in the pane's words. */
+export function stopWord(reason: string | null | undefined): Step['stop'] {
+  if (reason === 'tool_use') return 'tools'
+  if (reason === 'end_turn' || reason === 'stop_sequence') return 'answer'
+  if (reason === 'max_tokens' || reason === 'model_context_window_exceeded') return 'cut'
+  if (reason === 'refusal') return 'refused'
+  if (reason === 'pause_turn' || reason === 'compaction') return 'paused'
+  return 'none'
+}
+
+/** The tools one response asked for, most asked first: names and counts, never arguments. */
+export function askedFor(uses: readonly { name?: unknown }[] | null | undefined) {
+  const counts = new Map<string, number>()
+  for (const use of uses ?? []) {
+    const tool = shortTool(typeof use?.name === 'string' ? use.name : '')
+    counts.set(tool, (counts.get(tool) ?? 0) + 1)
+  }
+  return [...counts].map(([tool, count]) => ({ tool, count })).sort((a, b) => b.count - a.count).slice(0, 4)
+}
+
+/** `asked for Read ×3, Grep`, `answered`. */
+export function stepLine(step: Step) {
+  if (step.tools.length) return `asked for ${step.tools.map(t => (t.count > 1 ? `${t.tool} ×${t.count}` : t.tool)).join(', ')}`
+  return { tools: 'asked for tools', answer: 'answered', cut: 'ran out of room', refused: 'refused', paused: 'paused', none: 'no response' }[step.stop]
+}
+
+type ApiUsage = Partial<Record<'input_tokens' | 'output_tokens' | 'cache_read_input_tokens' | 'cache_creation_input_tokens', number>>
+
+/** A running total with one response's counts added. */
+export function addTokens(sum: Tokens, usage: ApiUsage | null | undefined): Tokens {
+  if (!usage) return sum
+  return {
+    fresh: sum.fresh + whole(usage.input_tokens), cached: sum.cached + whole(usage.cache_read_input_tokens),
+    written: sum.written + whole(usage.cache_creation_input_tokens), out: sum.out + whole(usage.output_tokens),
+  }
+}
+
+/** The share of what the model read that the cache served, 0 to 100; null when it read nothing. */
+export function cacheShare(t: Tokens) {
+  const read = t.fresh + t.cached + t.written
+  return read > 0 ? Math.round((t.cached / read) * 100) : null
+}
+
+/** The calls per tool with one more counted, most called first. */
+export function countTool(counts: { tool: string; count: number }[], tool: string) {
+  const name = shortTool(tool)
+  const next = counts.some(c => c.tool === name)
+    ? counts.map(c => (c.tool === name ? { ...c, count: c.count + 1 } : c))
+    : [...counts, { tool: name, count: 1 }]
+  return next.sort((a, b) => b.count - a.count).slice(0, TOOLS_KEPT)
+}
+
+/** `Bash 21, Read 12, Edit 9, Grep 4`: the tools called most. */
+export const toolMix = (counts: { tool: string; count: number }[], most = 4) =>
+  counts.slice(0, most).map(c => `${c.tool} ${grouped(c.count)}`).join(', ')
+
+const HRN_TOOL = /^mcp__hrn__(run|batch|flow|remote_submit)$/
+
+/**
+ * A call that hands a task to hrn, with the backend it names ('' for none) and whether the call waits for the
+ * task to end; null for any other call.
+ */
+export function handoff(tool: string, input: Record<string, unknown>): { backend: string; waits: boolean } | null {
+  const backend = (v: unknown) => (typeof v === 'string' && /^[a-z][a-z0-9_-]{0,15}$/.test(v) ? v : '')
+  const viaTool = HRN_TOOL.exec(tool)
+  // A submitted job is queued and answered at once; its end is asked for with another tool.
+  if (viaTool) return { backend: backend(input.backend), waits: viaTool[1] !== 'remote_submit' }
+  if ((tool !== 'Bash' && tool !== 'PowerShell') || typeof input.command !== 'string') return null
+  const m = /^hrn(?:\.exe)?\s+(?:run|batch|flow)\b([\s\S]*)$/.exec(program(input.command))
+  if (!m) return null
+  // Only the flags before the task: its text, in quotes or after another command, is never read.
+  const flags = (m[1] ?? '').split(/["'`]|&&|\|\||[;|\n]/)[0] ?? ''
+  return { backend: backend(/(?:^|\s)(?:-b|--backend)[\s=]+(\S+)/.exec(flags)?.[1]), waits: input.run_in_background !== true }
+}
+
+/** The context window by category: what fills it, largest first, then the compaction reserve and the room left. */
+export function parseContextParts(breakdown: unknown): ContextPart[] | null {
+  const rows = breakdown && typeof breakdown === 'object' ? (breakdown as { categories?: unknown }).categories : null
+  if (!Array.isArray(rows)) return null
+  const parts = rows
+    .map(r => (r && typeof r === 'object' ? r : {}) as Record<string, unknown>)
+    .filter(r => (r.kind === 'used' || r.kind === 'free' || r.kind === 'buffer') && typeof r.name === 'string' && typeof r.tokens === 'number' && r.tokens > 0)
+    .map(r => ({
+      name: (r.name as string).replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 28),
+      tokens: whole(r.tokens), kind: r.kind as ContextPart['kind'],
+    }))
+  if (parts.length === 0) return null
+  const used = parts.filter(part => part.kind === 'used').sort((a, b) => b.tokens - a.tokens)
+  const rest = used.slice(5).reduce((n, part) => n + part.tokens, 0)
+  return [
+    ...used.slice(0, 5), ...(rest ? [{ name: 'Other', tokens: rest, kind: 'used' as const }] : []),
+    ...parts.filter(part => part.kind === 'buffer'), ...parts.filter(part => part.kind === 'free'),
+  ]
+}
+
+/** What the loop is doing now, in one sentence. */
+export function stageLine(s: Pick<AdaState, 'stage' | 'stepCount' | 'turnStartedAt' | 'loopTool' | 'loopRunning' | 'lastTurn' | 'loopCalls'>) {
+  if (s.turnStartedAt) {
+    if (s.stage === 'tools') {
+      return `Running ${shortTool(s.loopTool)}${s.loopRunning > 1 ? ` and ${grouped(s.loopRunning - 1)} more` : ''}; the results go back to the model.`
+    }
+    const request = `Request ${grouped(Math.max(1, s.stepCount))}`
+    return s.loopCalls ? `${request}: the model reads the results and decides what to do next.` : `${request}: the model reads the conversation and decides what to do.`
+  }
+  if (s.lastTurn) {
+    const size = `${plural(s.lastTurn.steps, 'request', 'requests')} and ${plural(s.lastTurn.loopCalls, 'tool call', 'tool calls')}`
+    return s.lastTurn.stopped ? `The last turn was stopped after ${size}.` : `The last turn took ${size}.`
+  }
+  return 'Waiting for a prompt.'
+}
+
+const modelName = (v: unknown) => (typeof v === 'string' && /^[A-Za-z0-9._:@[\]/-]{1,60}$/.test(v) ? v.slice(0, 40) : '')
+const effortWord = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? String(v) : typeof v === 'string' && /^[a-z]{1,8}$/.test(v) ? v : '')
 
 // ---- Formatters ----
 
@@ -581,7 +726,69 @@ export function strip(calls: ToolBar[]) {
     const h = heights[i] ?? 3
     return `<rect x="${(offset + i) * 6}" y="${28 - h}" width="4" height="${h}" rx="1" fill="${call.ok ? OK_FILL : FAILED_FILL}"/>`
   }).join('')
-  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 238 28" width="238" height="28"><title>The last ${shown.length} tool calls</title>${bars}</svg>`
+  // A dashed line marks the 40 places, so a few bars read as the end of a track and not as adrift.
+  const track = `<line x1="0" y1="27" x2="238" y2="27" stroke="${UNFILLED}" stroke-opacity="0.5" stroke-width="2" stroke-dasharray="4 2"/>`
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 238 28" width="238" height="28"><title>The last ${shown.length} tool calls</title>${track}${bars}</svg>`
+}
+
+export type Share = { value: number; fill: string; faint?: boolean }
+
+/** Where each part of a whole starts and ends on a line of the given length. */
+function spans(parts: Share[], length: number) {
+  const total = parts.reduce((n, part) => n + Math.max(0, part.value), 0)
+  let sum = 0
+  return total <= 0 ? [] : parts.map(part => {
+    const from = Math.round((sum / total) * length)
+    sum += Math.max(0, part.value)
+    return { part, from, to: Math.round((sum / total) * length) }
+  }).filter(span => span.to > span.from)
+}
+
+/** One bar split by share. */
+export function stack(parts: Share[], title: string) {
+  const rects = spans(parts, 320).map(({ part, from, to }) =>
+    `<rect x="${from}" y="0" width="${Math.max(1, to - from - 1)}" height="10" rx="2" fill="${part.fill}"${part.faint ? ' fill-opacity="0.5"' : ''}/>`).join('')
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 10" width="320" height="10"><title>${title.replace(/[<>&]/g, '')}</title>${rects}</svg>`
+}
+
+/** The same bar as block characters, one run per part. */
+export function stackRuns(parts: Share[], cells = 30) {
+  return spans(parts, cells).map(({ part, from, to }) => ({ text: (part.faint ? '░' : '█').repeat(to - from), fill: part.fill, faint: !!part.faint }))
+}
+
+export type Station = { label: string; line: string; state: 'now' | 'done' | 'idle' }
+
+const stationText = (text: string) => text.replace(/[^0-9A-Za-z :,._–-]/g, '').slice(0, 14)
+
+// A hollow station is one not in use: an outline and grey words, which stay readable on either theme.
+const station = (x: number, y: number, s: Station, hollow = false) =>
+  (hollow
+    ? `<rect x="${x + 0.5}" y="${y + 0.5}" width="67" height="33" rx="8" fill="none" stroke="${UNFILLED}" stroke-dasharray="3 2"/>`
+    : `<rect x="${x}" y="${y}" width="68" height="34" rx="8" fill="${STATION_FILL[s.state]}"/>`)
+  + `<text x="${x + 34}" y="${y + 14}" text-anchor="middle" font-size="11" font-weight="700" fill="${hollow ? HOLLOW_TEXT : '#fff'}">${stationText(s.label)}</text>`
+  + `<text x="${x + 34}" y="${y + 27}" text-anchor="middle" font-size="10" fill="${hollow ? HOLLOW_TEXT : '#fff'}" fill-opacity="0.92">${stationText(s.line)}</text>`
+
+const ARROW_HEADS = { r: 'l-5 -3v6z', l: 'l5 -3v6z', d: 'l-3 -5h6z', u: 'l-3 5h6z' } as const
+const arrow = (path: string, x: number, y: number, to: keyof typeof ARROW_HEADS, dashed = false) =>
+  `<path d="${path}" fill="none" stroke="${UNFILLED}" stroke-width="1.6"${dashed ? ' stroke-dasharray="3 2"' : ''}/>`
+  + `<path d="M${x} ${y}${ARROW_HEADS[to]}" fill="${UNFILLED}"/>`
+
+/**
+ * The loop as a picture: you, the model, the tools and the answer in a row, the model and the tools passing
+ * work back and forth. With a lane, the road a task takes through hrn hangs under the tools, hollow until one is sent.
+ */
+export function loopPicture(stations: Station[], lane: Station[] | null) {
+  const row = stations.slice(0, 4).map((s, i) => station(i * 84, 0, s)).join('')
+    + arrow('M70 17H78', 82, 17, 'r')
+    + arrow('M154 11H162', 166, 11, 'r') + arrow('M166 23H158', 154, 23, 'l')
+    + arrow('M238 17H246', 250, 17, 'r')
+  const unused = !!lane && lane.every(s => s.state === 'idle')
+  const under = !lane ? '' : arrow('M190 34V42H34V45', 34, 50, 'd', true) + arrow('M214 50V39', 214, 34, 'u', true)
+    + lane.slice(0, 3).map((s, i) => station(i * 84, 50, s, unused)).join('')
+    + arrow('M70 67H78', 82, 67, 'r') + arrow('M154 67H162', 166, 67, 'r')
+  const height = lane ? 84 : 34
+  return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 ${height}" width="320" height="${height}" font-family="system-ui,-apple-system,Segoe UI,sans-serif">`
+    + `<title>How a turn runs</title>${row}${under}</svg>`
 }
 
 /** Thirty-five days of delivery in this repository, one bar a day, height by experience. */
@@ -664,8 +871,7 @@ async function refreshPr($: EngineInterface) {
   try {
     const state = await read($, pane)
     if (state.view !== 'repo') return
-    const shown = await safely(() => $.ui.panes())
-    if (!shown?.some(p => p.id === 'ada' && p.isShown)) return
+    if (!await onScreen($)) return
     const now = await $.clock.now()
     if (tooSoon(now, prAt, PR_EVERY_MS)) return
     const repo = await $.session.repo()
@@ -684,8 +890,7 @@ async function refreshRuns($: EngineInterface) {
   try {
     const state = await read($, pane)
     if (state.view !== 'repo') return
-    const shown = await safely(() => $.ui.panes())
-    if (!shown?.some(p => p.id === 'ada' && p.isShown)) return
+    if (!await onScreen($)) return
     const now = await $.clock.now()
     if (tooSoon(now, runsRefusedAt, FLAG_RETRY_MS)) return
     const live = state.runs?.some(run => isLive(run, now)) ?? false
@@ -715,8 +920,7 @@ async function refreshWatch($: EngineInterface) {
   try {
     const state = await read($, pane)
     if (state.view !== 'repo') return
-    const shown = await safely(() => $.ui.panes())
-    if (!shown?.some(p => p.id === 'ada' && p.isShown)) return
+    if (!await onScreen($)) return
     // The link sits among the GitHub links and is drawn on the terminal only: without either, nothing would show it.
     if (!githubRepo((await safely(() => $.session.repo()))?.remote)) return
     if (!(await safely(() => $.session.surfaces()))?.includes('terminal')) return
@@ -740,13 +944,41 @@ async function refreshRepo($: EngineInterface) {
   await refreshRuns($)
   await refreshWatch($)
   const state = await safely(() => read($, pane))
-  const shown = await safely(() => $.ui.panes())
   const gh = githubRepo((await safely(() => $.session.repo()))?.remote)
   const now = await safely(() => $.clock.now()) ?? 0
   // Only the quick per-repository answer is worth asking this often; the full one waits for its own time.
-  if (gh && !tooSoon(now, repoRefusedAt, FLAG_RETRY_MS) && state?.view === 'repo' && shown?.some(p => p.id === 'ada' && p.isShown)) {
+  if (gh && !tooSoon(now, repoRefusedAt, FLAG_RETRY_MS) && state?.view === 'repo' && await onScreen($)) {
     await refresh($, false, PR_EVERY_MS)
   }
+}
+
+/** What fills the context, by category; asked only while the agent view is on screen. */
+async function refreshContext($: EngineInterface) {
+  try {
+    const state = await read($, pane)
+    if (state.view !== 'agent' || !await onScreen($)) return
+    const now = await $.clock.now()
+    if (contextBusy || tooSoon(now, contextAt, CONTEXT_EVERY_MS)) return
+    contextAt = now
+    contextBusy = true
+    try {
+      const usage = await $.session.usage({ breakdown: 'summary' })
+      const parts = parseContextParts(usage.context?.breakdown)
+      await change($, s => ({ ...s, contextParts: parts ? { at: now, parts } : null }))
+    } finally { contextBusy = false }
+  } catch { /* The section stays as it was. */ }
+}
+
+/** Whether a loop is a helper the engine lists; one of its own forks is not. */
+async function isHelper($: EngineInterface, agentId: string) {
+  if (helperIds.has(agentId)) return true
+  for (const agent of await safely(() => $.agent.list()) ?? []) helperIds.add(agent.id)
+  return helperIds.has(agentId)
+}
+
+/** Whether a surface shows the pane now: nothing is asked for a pane nobody sees. */
+async function onScreen($: EngineInterface) {
+  return (await safely(() => $.ui.panes()))?.some(p => p.id === 'ada' && p.isShown) ?? false
 }
 
 function startTicker($: EngineInterface) {
@@ -764,10 +996,20 @@ async function safely<T>(fn: () => Promise<T>): Promise<T | null> {
 }
 
 const VIEWS: { id: AdaView; label: string }[] = [
-  { id: 'session', label: 'Session' }, { id: 'repo', label: 'Repo' }, { id: 'you', label: 'You' },
+  { id: 'session', label: 'Session' }, { id: 'agent', label: 'Agent' }, { id: 'repo', label: 'Repo' }, { id: 'you', label: 'You' },
 ]
 
 const clip = (text: string, n: number) => (text.length > n ? `${text.slice(0, n - 1)}…` : text)
+
+/** `Explore 4, general-purpose 2`: helpers by type, the three most started. */
+export function countKinds(types: string[]) {
+  const counts = new Map<string, number>()
+  for (const type of types) {
+    const name = /^[A-Za-z][A-Za-z0-9:_.-]{0,39}$/.test(type) ? type : 'other'
+    counts.set(name, (counts.get(name) ?? 0) + 1)
+  }
+  return [...counts].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([name, count]) => `${name} ${grouped(count)}`).join(', ')
+}
 const plural = (n: number, one: string, many: string) => `${grouped(n)} ${n === 1 ? one : many}`
 
 export const register: Register = (on, options) => {
@@ -781,6 +1023,7 @@ export const register: Register = (on, options) => {
     void recall($).then(async () => {
       await refreshGit($)
       await refreshRepo($)
+      await refreshContext($)
       await refresh($)
       await rebuild($)
     })
@@ -805,14 +1048,61 @@ export const register: Register = (on, options) => {
     const result = await next(e)
     if (e.agentId) return result
     const now = await safely(() => $.clock.now()) ?? 0
-    await change($, s => ({ ...s, turnStartedAt: now || 1, turnCalls: 0, tick: 0, reaction: 'Let’s see what we can do.', mood: 'busy' }))
+    await change($, s => ({
+      ...s, turnStartedAt: now || 1, turnCalls: 0, tick: 0, reaction: 'Let’s see what we can do.', mood: 'busy',
+      stage: 'model', steps: [], stepCount: 0, turnTokens: NO_TOKENS, loopCalls: 0, loopTool: '', loopRunning: 0,
+    }))
     startTicker($)
+    return result
+  })
+  // One model request of a turn. The stream beneath is passed on piece by piece, untouched,
+  // and no update is waited for: the request and its result are never held back.
+  on('turn.step', async function* ($, e, next) {
+    const agentId = e.agentId
+    if (agentId === undefined) {
+      void change($, s => ({ ...s, stage: 'model', stepCount: Math.max(s.stepCount, e.index + 1), model: modelName(e.model), effort: effortWord(e.effort) }))
+    }
+    const result = yield* next(e)
+    try {
+      const usage = result?.usage ?? null
+      const step: Step = { index: e.index, stop: stopWord(result?.stopReason), tools: askedFor(result?.toolUses), out: whole(usage?.output_tokens) }
+      if (agentId === undefined) {
+        void change($, s => ({
+          ...s,
+          steps: [...s.steps.filter(kept => kept.index !== step.index), step].slice(-STEPS_KEPT),
+          turnTokens: addTokens(s.turnTokens, usage), sessionTokens: addTokens(s.sessionTokens, usage),
+        }))
+      } else if (usage) {
+        void isHelper($, agentId).then(listed => (listed ? change($, s => ({ ...s, helperTokens: addTokens(s.helperTokens, usage) })) : undefined))
+      }
+    } catch { /* Observation must not affect the session. */ }
     return result
   })
   on('tool.call', async ($, e, next) => {
     const started = await safely(() => $.clock.now()) ?? 0
-    await change($, s => ({ ...s, running: s.running + 1, lastTool: e.tool, lastToolAt: started, lastStatus: 'running', reaction: 'On it.', mood: 'busy' }))
-    const result = await next(e)
+    const main = e.agentId === undefined
+    const input = e as unknown as Record<string, unknown>
+    const handed = handoff(e.tool, input)
+    // A task sent off without waiting is counted as sent; its end is not seen.
+    const waited = handed?.waits === true
+    await change($, s => ({
+      ...s, running: s.running + 1, lastTool: e.tool, lastToolAt: started, lastStatus: 'running', reaction: 'On it.', mood: 'busy',
+      ...(main ? { stage: 'tools' as const, loopTool: e.tool, loopRunning: s.loopRunning + 1 } : {}),
+      ...(handed ? {
+        handoffs: {
+          ...s.handoffs, sent: s.handoffs.sent + 1, running: s.handoffs.running + (waited ? 1 : 0),
+          backends: handed.backend && !s.handoffs.backends.includes(handed.backend) ? [...s.handoffs.backends, handed.backend].slice(0, 6) : s.handoffs.backends,
+        },
+      } : {}),
+    }))
+    const result = await next(e).catch(async (err: unknown) => {
+      // A call that never answers must not stay counted as running.
+      await change($, s => ({
+        ...s, running: Math.max(0, s.running - 1), loopRunning: Math.max(0, s.loopRunning - (main ? 1 : 0)),
+        ...(waited ? { handoffs: { ...s.handoffs, running: Math.max(0, s.handoffs.running - 1), failed: s.handoffs.failed + 1 } } : {}),
+      }))
+      throw err
+    })
     const ended = await safely(() => $.clock.now()) ?? started
     const error = result.deny !== undefined || result.isError === true
     const runner = e.tool === 'Bash' && e.run_in_background !== true ? testRunner(e.command) : null
@@ -828,10 +1118,24 @@ export const register: Register = (on, options) => {
       calls: pushCall(s.calls, bar), callCount: s.callCount + 1, failedCount: s.failedCount + (error ? 1 : 0),
       slowest: !s.slowest || bar.ms > s.slowest.ms ? bar : s.slowest,
       turnCalls: s.turnCalls + 1,
+      ...(main ? { loopCalls: s.loopCalls + 1, loopRunning: Math.max(0, s.loopRunning - 1) } : {}),
+      toolCounts: countTool(s.toolCounts, e.tool),
+      helpersStarted: s.helpersStarted + (e.tool === 'Agent' && !error ? 1 : 0),
+      // A call that was refused handed nothing over; one that returned says nothing of its checks.
+      ...(handed && result.deny !== undefined ? {
+        handoffs: { ...s.handoffs, sent: Math.max(0, s.handoffs.sent - 1), running: Math.max(0, s.handoffs.running - (waited ? 1 : 0)) },
+      } : waited ? {
+        handoffs: {
+          ...s.handoffs, running: Math.max(0, s.handoffs.running - 1),
+          back: s.handoffs.back + (error ? 0 : 1), failed: s.handoffs.failed + (error ? 1 : 0),
+        },
+      } : {}),
       tests: tests ?? s.tests,
       editedSinceTests: tests ? false : s.editedSinceTests || (writesFiles && !error && s.tests !== null),
-      reaction: tests ? (error ? 'Tests failed; worth a look.' : 'Tests passed. Nice.') : error ? 'That one failed; worth a look.' : 'Done. What’s next?',
-      mood: error ? 'worried' : tests ? 'glad' : 'idle',
+      // Inside a turn a finished call is not the end: the model reads its result next.
+      reaction: tests ? (error ? 'Tests failed; worth a look.' : 'Tests passed. Nice.') : error ? 'That one failed; worth a look.'
+        : !s.turnStartedAt ? 'Done. What’s next?' : s.running > 1 ? 'On it.' : 'Thinking it over.',
+      mood: error ? 'worried' : tests ? 'glad' : s.turnStartedAt ? 'busy' : 'idle',
     }))
     await record($, { kind: 'tool', tool: e.tool, status: error ? 'error' : 'ok' })
     if (writesFiles) void refreshGit($)
@@ -843,12 +1147,12 @@ export const register: Register = (on, options) => {
     stopTicker()
     await change($, s => ({
       ...s,
-      turnStartedAt: 0, tick: 0, running: 0,
-      lastTurn: { ms: Math.max(0, e.durationMs), calls: s.turnCalls },
+      turnStartedAt: 0, tick: 0, running: 0, stage: 'idle', loopRunning: 0,
+      lastTurn: { ms: Math.max(0, e.durationMs), calls: s.turnCalls, steps: s.stepCount, loopCalls: s.loopCalls, stopped: e.isAborted === true },
       ...(e.isAborted ? { reaction: 'Stopped. Over to you.', mood: 'idle' as const }
         : s.mood === 'busy' ? { reaction: 'Done. What’s next?', mood: 'idle' as const } : {}),
     }))
-    void refreshGit($).then(() => refreshRepo($)).then(() => refresh($)).then(() => rebuild($))
+    void refreshGit($).then(() => refreshRepo($)).then(() => refreshContext($)).then(() => refresh($)).then(() => rebuild($))
     return result
   })
   on('ui.render', { component: 'Pane', requestId: 'ada' }, async ($, e) => {
@@ -857,6 +1161,8 @@ export const register: Register = (on, options) => {
     const now = await safely(() => $.clock.now()) ?? 0
     const usage = await safely(() => $.session.usage())
     const repo = await safely(() => $.session.repo())
+    // Helpers are read from the engine's own list, never their task or what they wrote.
+    const agents = state.view === 'agent' ? await safely(() => $.agent.list()) : null
     const gh = githubRepo(repo?.remote)
     const terminal = e.surface === 'terminal'
     const picture = (source: string, alt: string) => {
@@ -867,10 +1173,13 @@ export const register: Register = (on, options) => {
       return <Svg source={source} alt={alt} width={width} height={height} />
     }
     const view: AdaView = state.view === 'repo' && !repo ? 'session' : state.view
+    // A reading taken in a repository says nothing once the session stands outside one.
+    const git = repo ? state.git : null
     const show = (next: AdaView) => () => {
       void change($, s => ({ ...s, view: next })).then(async () => {
         try { await $.store.set('view', next) } catch { /* The next session opens on Session. */ }
         if (next === 'repo') await refreshRepo($)
+        if (next === 'agent') await refreshContext($)
       })
     }
     const fill = (text: string) => () => { void $.prompt.fill({ text, mode: 'insert' }) }
@@ -911,21 +1220,27 @@ export const register: Register = (on, options) => {
     let title = ''
     let under = ''
     let right: RenderChildren = null
-    if (view === 'session') {
+    if (view === 'session' || view === 'agent') {
       ringPercent = context
       ringSource = ring(context, { mood: state.mood })
       ringAlt = `Ada, context ${context === null ? 'not known yet' : percentText(context)}`
-      title = clip(state.reaction, 40)
-      under = state.lastTool ? `${state.lastTool}, ${state.lastStatus === 'running' ? 'running' : age(now, state.lastToolAt)}` : 'No tool calls yet'
+      if (view === 'session') {
+        title = clip(state.reaction, 40)
+        under = state.lastTool ? `${shortTool(state.lastTool)}, ${state.lastStatus === 'running' ? 'running' : age(now, state.lastToolAt)}` : 'No tool calls yet'
+      } else {
+        title = state.turnStartedAt ? (state.stage === 'tools' ? 'Using tools' : 'Thinking')
+          : state.lastTurn ? (state.lastTurn.stopped ? 'Stopped' : 'Answered') : 'Waiting for a prompt'
+        under = state.model ? `${state.model}${state.effort ? `, ${state.effort} effort` : ''}` : 'No request yet'
+      }
+      // The line beside Ada already says when a turn is done; the chip is for what needs a look.
       right = state.lastStatus === 'error' ? chip('Failed', 'error')
-        : state.turnStartedAt || state.running ? chip('Working', 'warning')
-          : state.lastTurn || state.callCount ? chip('Done', 'success') : null
+        : state.turnStartedAt || state.running ? chip('Working', 'warning') : null
     } else if (view === 'repo') {
       ringPercent = delivery ? delivery.share * 100 : null
       ringSource = ring(ringPercent, { mood: state.mood })
       ringAlt = delivery ? `Ada, ${percentText(ringPercent ?? 0)} of the week’s delivery` : 'Ada'
       title = clip(gh ? gh.name : repo?.name ?? (repo?.root.split(/[\\/]/).filter(Boolean).pop() || 'This repository'), 40)
-      under = state.git ? state.git.head : ''
+      under = git ? git.head : ''
       right = !checks || pr?.checks.length === 0 ? null
         : checks.failed ? chip('CI failing', 'error')
           : checks.running ? chip('CI running', 'warning') : chip('CI passing', 'success')
@@ -977,8 +1292,8 @@ export const register: Register = (on, options) => {
           : tile('Last turn', '–', 'none yet')
       const tests = state.tests
       const tree = [
-        state.git && state.git.head,
-        state.git && (state.git.changed ? plural(state.git.changed, 'file changed', 'files changed') : 'no changes'),
+        git && git.head,
+        git && (git.changed ? plural(git.changed, 'file changed', 'files changed') : 'no changes'),
       ].filter((p): p is string => !!p)
       const action = chooseAction(state, context)
       return (
@@ -995,8 +1310,9 @@ export const register: Register = (on, options) => {
                 : picture(strip(state.calls), `The last ${state.calls.length} tool calls, ${state.calls.filter(c => !c.ok).length} failed`)}
               <Text size="caption" dimColor>
                 {plural(state.callCount, 'call', 'calls')}{state.failedCount ? `, ${grouped(state.failedCount)} failed` : ''}.
-                {state.slowest ? ` Slowest: ${state.slowest.tool}, ${duration(state.slowest.ms)}` : ''}
+                {state.slowest ? ` Slowest: ${shortTool(state.slowest.tool)}, ${duration(state.slowest.ms)}` : ''}
               </Text>
+              {state.toolCounts.length > 1 && <Text size="caption" dimColor>{toolMix(state.toolCounts)}</Text>}
             </Box>
           ))}
           {(tree.length > 0 || tests) && (
@@ -1012,9 +1328,116 @@ export const register: Register = (on, options) => {
       )
     }
 
+    // ---- Agent ----
+    const agentView = () => {
+      const turning = !!state.turnStartedAt
+      const ended = !turning && !!state.lastTurn
+      const answered = ended && !state.lastTurn?.stopped
+      const steps = turning ? state.stepCount : state.lastTurn?.steps ?? 0
+      // The main loop's own calls: a helper's are its own loop's.
+      const calls = turning ? state.loopCalls : state.lastTurn?.loopCalls ?? 0
+      const at = (here: boolean, was: boolean): Station['state'] => (here ? 'now' : was ? 'done' : 'idle')
+      const stations: Station[] = [
+        { label: 'You', line: 'prompt', state: at(false, turning || ended) },
+        { label: 'Model', line: plural(steps, 'request', 'requests'), state: at(turning && state.stage !== 'tools', steps > 0) },
+        { label: 'Tools', line: plural(calls, 'call', 'calls'), state: at(turning && state.stage === 'tools', calls > 0) },
+        { label: 'Answer', line: turning ? stopwatch(now - state.turnStartedAt) : !state.lastTurn ? 'waiting' : answered ? stopwatch(state.lastTurn.ms) : 'stopped', state: at(false, answered) },
+      ]
+      const sent = state.handoffs
+      // hrn has a lane once it answered here or was handed a task; without it the picture is the session alone.
+      const lane: Station[] | null = !stats && !sent.sent ? null : [
+        { label: 'hrn', line: sent.sent ? plural(sent.sent, 'task', 'tasks') : 'no task yet', state: at(sent.running > 0, sent.sent > 0) },
+        { label: 'Backend', line: sent.backends.length === 1 ? sent.backends[0] ?? '' : sent.backends.length ? `${sent.backends.length} backends` : 'its own', state: at(sent.running > 0, sent.sent > 0) },
+        { label: 'Result', line: sent.failed ? `${grouped(sent.failed)} failed` : sent.back ? `${grouped(sent.back)} back` : 'comes back', state: at(false, sent.back + sent.failed > 0) },
+      ]
+      const stationColor = (s: Station) => (s.state === 'now' ? 'claude' : s.state === 'done' ? 'success' : undefined)
+      const road = (list: Station[], joins: string[]) => (
+        <Text>{list.map((s, i) => <Text>{i ? joins[i - 1] ?? ' → ' : ''}<Text color={stationColor(s)} weight={s.state === 'now' ? 'bold' : undefined} dimColor={s.state === 'idle'}>{s.label} ({s.line})</Text></Text>)}</Text>
+      )
+
+      const took = state.turnTokens
+      const share = cacheShare(took)
+      const readParts: Share[] = [
+        { value: took.cached, fill: OK_FILL }, { value: took.fresh, fill: FRESH_FILL }, { value: took.written, fill: WRITTEN_FILL },
+      ]
+      const bar = (parts: Share[], alt: string) => (terminal
+        ? <Text>{stackRuns(parts).map(run => <Text color={run.fill} dimColor={run.faint}>{run.text}</Text>)}</Text>
+        : picture(stack(parts, alt), alt))
+      const key = (rows: { name: string; tokens: number; fill: string }[]) => (
+        <Box flexDirection="row" flexWrap="wrap" columnGap={2}>
+          {rows.map(row => <Text size="caption"><Text color={row.fill}>■</Text> {row.name} <Text dimColor>{tokenCount(row.tokens)}</Text></Text>)}
+        </Box>
+      )
+      const all = state.sessionTokens
+      const kept = state.contextParts?.parts ?? null
+      const partFill = (part: ContextPart, i: number) => (part.kind === 'used' ? PART_FILLS[i % PART_FILLS.length] ?? UNFILLED : UNFILLED)
+      const live = (agents ?? []).filter(a => a.status === 'running' || a.status === 'pending' || a.status === 'waiting')
+      const kinds = countKinds((agents ?? []).map(a => a.type))
+      const helped = state.helperTokens
+      return (
+        <Box flexDirection="column" gap={1}>
+          {section('The loop', (
+            <Box flexDirection="column">
+              {terminal
+                ? <Box flexDirection="column">{road(stations, [' → ', ' ⇄ ', ' → '])}{lane && road(lane, [' → ', ' → '])}</Box>
+                : picture(loopPicture(stations, lane), `You, the model, the tools and the answer: ${stageLine(state)}`)}
+              <Text>{stageLine(state)}</Text>
+              <Text size="caption" dimColor>Each request, the model reads the whole conversation, then asks for tools or answers.</Text>
+            </Box>
+          ))}
+          {state.steps.length > 0 && section(turning ? 'This turn, request by request' : 'Last turn, request by request', (
+            <Box flexDirection="column">
+              {steps > state.steps.length && <Text size="caption" dimColor>{plural(steps - state.steps.length, 'earlier request', 'earlier requests')}</Text>}
+              {state.steps.map(step => (
+                <Text size="caption"><Text mono tabular dimColor>{String(step.index + 1).padStart(2, ' ')}</Text> {stepLine(step)}<Text dimColor>, {tokenCount(step.out)} written</Text></Text>
+              ))}
+            </Box>
+          ))}
+          {share !== null && section(turning ? 'What the model read this turn' : 'What the model read last turn', (
+            <Box flexDirection="column">
+              {bar(readParts, `${share}% of it came from the cache`)}
+              {key([
+                { name: 'From the cache', tokens: took.cached, fill: OK_FILL }, { name: 'New', tokens: took.fresh, fill: FRESH_FILL },
+                { name: 'Saved for next time', tokens: took.written, fill: WRITTEN_FILL },
+              ].filter(row => row.tokens > 0))}
+              <Text size="caption" dimColor>
+                {share}% came from the cache, so a request pays mostly for what changed. This session: {tokenCount(all.fresh + all.cached + all.written)} read, {tokenCount(all.out)} written.
+              </Text>
+            </Box>
+          ))}
+          {kept && section('What fills the context', (
+            <Box flexDirection="column">
+              {bar(kept.map((part, i) => ({ value: part.tokens, fill: partFill(part, i), faint: part.kind === 'free' })), 'The context window by what fills it')}
+              {key(kept.map((part, i) => ({ name: part.name, tokens: part.tokens, fill: partFill(part, i) })))}
+            </Box>
+          ))}
+          {(live.length > 0 || state.helpersStarted > 0) && section('Helpers', (
+            <Box flexDirection="column">
+              <Text>{grouped(live.length)} running, {grouped(Math.max(state.helpersStarted, (agents ?? []).length))} started this session</Text>
+              {kinds && <Text size="caption" dimColor>{kinds}</Text>}
+              {helped.out > 0 && <Text size="caption" dimColor>They read {tokenCount(helped.fresh + helped.cached + helped.written)} and wrote {tokenCount(helped.out)}.</Text>}
+              <Text size="caption" dimColor>A helper is the same loop again with a context of its own; only its report comes back.</Text>
+            </Box>
+          ))}
+          {section('Through hrn', (
+            <Box flexDirection="column">
+              <Text dimColor={!sent.sent}>
+                {sent.sent
+                  ? `${plural(sent.sent, 'task', 'tasks')} handed over: ${[
+                    sent.back && `${grouped(sent.back)} came back`, sent.failed && `${grouped(sent.failed)} failed`, sent.running && `${grouped(sent.running)} running`,
+                  ].filter(Boolean).join(', ') || 'not waited for'}`
+                  : stats ? 'Nothing handed to hrn this session.' : 'hrn has not answered here: this is the session alone.'}
+              </Text>
+              {sent.backends.length > 0 && <Text size="caption" dimColor>On {sent.backends.join(', ')}</Text>}
+              <Text size="caption" dimColor>hrn runs a task on a backend of its choosing and records the run; in a batch each task gets its own branch and gate checks.</Text>
+            </Box>
+          ))}
+        </Box>
+      )
+    }
+
     // ---- Repo ----
     const repoView = () => {
-      const git = state.git
       const runs = gh ? state.runs : null
       const links = gh ? repoLinks(gh) : null
       const branchLine = git ? [
@@ -1152,7 +1575,7 @@ export const register: Register = (on, options) => {
       <Box flexDirection="column" gap={1} paddingX={1}>
         {header}
         {switcher}
-        {view === 'session' ? sessionView() : view === 'repo' ? repoView() : youView()}
+        {view === 'session' ? sessionView() : view === 'agent' ? agentView() : view === 'repo' ? repoView() : youView()}
       </Box>
     )
   })

@@ -12,7 +12,30 @@ export type Stats = {
   exercise: { kind: string; answered: boolean } | null
 }
 
-export type AdaView = 'session' | 'repo' | 'you'
+export type AdaView = 'session' | 'agent' | 'repo' | 'you'
+
+/** Where the main loop stands: waiting for the model, running tools, or between turns. */
+export type Stage = 'idle' | 'model' | 'tools'
+
+/** One model request of a turn, as the Agent view lists it: names and counts, never arguments or text. */
+export type Step = {
+  index: number
+  /** How the response ended: it asked for tools, answered, or was cut short. */
+  stop: 'tools' | 'answer' | 'cut' | 'refused' | 'paused' | 'none'
+  /** The tools it asked for, most asked first, four names at most. */
+  tools: { tool: string; count: number }[]
+  /** Tokens the response wrote. */
+  out: number
+}
+
+/** Token counts as the API reports them: read afresh, read from the cache, written to it, written out. */
+export type Tokens = { fresh: number; cached: number; written: number; out: number }
+
+/** Work this session handed to hrn: counts and backend names only. `back` is a call that returned, whatever its checks said. */
+export type Handoffs = { sent: number; running: number; back: number; failed: number; backends: string[] }
+
+/** One row of the context window by category, as the session breaks it down. */
+export type ContextPart = { name: string; tokens: number; kind: 'used' | 'free' | 'buffer' }
 
 /** One finished tool call, as the strip draws it. */
 export type ToolBar = { tool: string; ms: number; ok: boolean }
@@ -104,7 +127,29 @@ export type AdaState = {
   turnCalls: number
   /** Moved once a second while a turn runs, so the running time redraws. */
   tick: number
-  lastTurn: { ms: number; calls: number } | null
+  /** `calls` counts helpers' calls too; `loopCalls` the main loop's alone. */
+  lastTurn: { ms: number; calls: number; steps: number; loopCalls: number; stopped: boolean } | null
+  /** The main loop's own calls this turn, the last one it started and how many it has in flight. */
+  loopCalls: number
+  loopTool: string
+  loopRunning: number
+  stage: Stage
+  /** The model and effort of the main loop's last request; '' before one. */
+  model: string
+  effort: string
+  /** The running turn's requests, or the last turn's: the newest eight. */
+  steps: Step[]
+  stepCount: number
+  turnTokens: Tokens
+  sessionTokens: Tokens
+  /** What helpers (subagents) read and wrote this session. */
+  helperTokens: Tokens
+  helpersStarted: number
+  /** Calls per tool this session, at most 24 names. */
+  toolCounts: { tool: string; count: number }[]
+  handoffs: Handoffs
+  /** Null until the Agent view asked for it. */
+  contextParts: { at: number; parts: ContextPart[] } | null
   tests: TestRun | null
   editedSinceTests: boolean
   git: GitStatus | null

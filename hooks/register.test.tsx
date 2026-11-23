@@ -1,10 +1,14 @@
 import { expect, mock, test } from 'claude-code/testing'
+import type { TestBody } from 'claude-code/testing'
 import {
   age, barHeights, deliveryStrip, isLive, kindLine, parseDelivery, parseRuns, watchPage, weekStart, blockRuns, checkState, chooseAction, contextPercent, dayGrid, duration, githubRepo, levelSpan, macaw,
   parseGitStatus, parsePullRequest, parseStats, svgSize, percentText, planFigure, pushCall, readPullRequest, readPullRequestFailure,
   record, repoLinks, resetsIn, ring, stopwatch, strip, testRunner, tokenCount,
+  addTokens, askedFor, cacheShare, countKinds, countTool, handoff, loopPicture, parseContextParts, shortTool, stack, stackRuns,
+  stageLine, stepLine, stopWord, toolMix,
 } from './register'
-import type { EngineInterface, On, SessionUsage } from 'claude-code'
+import type { AgentInfo, EngineInterface, On, SessionUsage, TurnStepResult } from 'claude-code'
+import type { Station } from './register'
 import type { ToolBar } from '../types'
 
 const pane = { plugin: 'ada-pane', component: 'Pane', requestId: 'ada', props: {
@@ -74,6 +78,14 @@ type World = {
   surfaces?: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** What the watch address answers; unset refuses the connection. */
   page?: (url: string) => Promise<{ status: number; text: string }> | { status: number; text: string }
+  /** The context by category, given when the session is asked for a breakdown; unset gives none. */
+  breakdown?: unknown
+  /** The helpers the engine lists. */
+  agents?: Partial<AgentInfo>[]
+  /** What the model answers to one request; unset answers with no tools and no usage. A throw fails the request. */
+  step?: (index: number, agentId?: string) => Partial<TurnStepResult>
+  /** The pieces a response streams before it ends. */
+  chunks?: { kind: 'text'; index: number; text: string }[]
 }
 
 /** The engine beneath the plugin, with each outside program answered by the test. */
@@ -95,9 +107,19 @@ function world(on: On, w: World = {}) {
     return { value: { status: r.status, ok: r.status === 200, headers: {}, text: r.text } }
   })
   on('session.id', () => ({ value: 'session-1' }))
-  on('session.usage', () => {
+  const breakdowns: string[] = []
+  on('session.usage', (_, e) => {
     if (w.usage === null) throw new Error('not known yet')
-    return { value: w.usage ?? usage() }
+    const base = w.usage ?? usage()
+    const detail = (e as { breakdown?: string } | undefined)?.breakdown
+    if (!detail) return { value: base }
+    breakdowns.push(detail)
+    return { value: w.breakdown === undefined ? base : { ...base, context: { ...base.context, breakdown: w.breakdown } } as SessionUsage }
+  })
+  on('agent.list', () => ({ value: (w.agents ?? []) as AgentInfo[] }))
+  on('turn.step', async function* (_, e) {
+    for (const chunk of w.chunks ?? []) yield chunk
+    return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null, ...w.step?.(e.index, e.agentId) }
   })
   on('session.repo', () => ({ value: w.repo === undefined ? REPO : w.repo }))
   const isStamp = (path: string) => path.replace(/\\/g, '/').endsWith('/claude-sessions/.ledger-rebuild')
@@ -126,8 +148,24 @@ function world(on: On, w: World = {}) {
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', () => ({ text: '' }))
-  return { clock, files, runs, filled, store, fetched }
+  return { clock, files, runs, filled, store, fetched, breakdowns }
 }
+
+/** One model request of the turn, read to its end as the engine reads it; the pane's own updates then land. */
+async function request($: Parameters<TestBody>[0], w: { clock: { settle: () => Promise<unknown> } }, index: number, extra: { agentId?: string } = {}) {
+  const stream = $.turn.step({ turnId: 't1', index, model: 'claude-fable-5-2', effort: 'high', messageCount: 3 + index, ...extra })
+  const chunks: unknown[] = []
+  let piece = await stream.next()
+  while (!piece.done) {
+    chunks.push(piece.value)
+    piece = await stream.next()
+  }
+  await w.clock.settle()
+  return { chunks, result: piece.value }
+}
+
+const spent = (input: number, cached: number, written: number, out: number) =>
+  ({ input_tokens: input, cache_read_input_tokens: cached, cache_creation_input_tokens: written, output_tokens: out, model: 'claude-fable-5-2' })
 
 /** A prompt typed at the composer, as the engine hands it on. */
 const typed = (text: string) => ({ text, wait: false, origin: { kind: 'composer' as const } })
@@ -181,6 +219,7 @@ test('the strip scales by square root and keeps the last 40 calls', () => {
   const svg = strip([{ tool: 'Bash', ms: 900, ok: true }, { tool: 'Edit', ms: 100, ok: false }])
   expect((svg.match(/<rect /g) ?? []).length).toBe(2)
   expect(svg.includes('x="228"')).toBe(true)
+  expect((svg.match(/stroke-dasharray="4 2"/g) ?? []).length).toBe(1)
   expect(svg.includes('#d64545')).toBe(true)
   expect(blockRuns([{ tool: 'a', ms: 0, ok: true }, { tool: 'b', ms: 100, ok: true }, { tool: 'c', ms: 100, ok: false }]))
     .toEqual([{ text: '▁█', failed: false }, { text: '█', failed: true }])
@@ -519,7 +558,7 @@ test('the view is kept for the next session', async ($, on) => {
   await ui.unmount()
 })
 
-type Case = { name: string; w: World; view: 'session' | 'repo' | 'you'; check: (all: string, has: (key: string) => Promise<boolean>) => Promise<void> | void }
+type Case = { name: string; w: World; view: 'session' | 'agent' | 'repo' | 'you'; check: (all: string, has: (key: string) => Promise<boolean>) => Promise<void> | void }
 
 const STATES: Case[] = [
   { name: 'no tool call yet', w: {}, view: 'session', check: all => { expect(all.includes('No tool calls yet')).toBe(true) } },
@@ -543,6 +582,20 @@ const STATES: Case[] = [
   { name: 'usage not known yet', w: { usage: null }, view: 'session', check: all => { expect(all.includes('not known yet')).toBe(true) } },
   { name: 'game off', w: { hrn: () => ran('{"version":1,"enabled":false}') }, view: 'you', check: all => { expect(all.includes('The experience game is off in hrn')).toBe(true) } },
   { name: 'hrn not installed', w: { hrn: () => cannotStart('hrn') }, view: 'you', check: all => { expect(all.includes('hrn is not installed')).toBe(true) } },
+  { name: 'no request yet', w: {}, view: 'agent', check: all => {
+    expect(all.includes('Waiting for a prompt.')).toBe(true)
+    expect(all.includes('No request yet')).toBe(true)
+    expect(all.includes('request by request')).toBe(false)
+    expect(all.includes('What the model read')).toBe(false)
+    expect(all.includes('What fills the context')).toBe(false)
+    expect(all.includes('Helpers')).toBe(false)
+  } },
+  { name: 'no hrn on this computer', w: { hrn: () => cannotStart('hrn') }, view: 'agent', check: all => {
+    expect(all.includes('hrn has not answered here: this is the session alone.')).toBe(true)
+  } },
+  { name: 'hrn here, nothing handed over', w: { repo: null, hrn: () => ran(JSON.stringify(wire)) }, view: 'agent', check: all => {
+    expect(all.includes('Nothing handed to hrn this session.')).toBe(true)
+  } },
 ]
 
 STATES.forEach((c, i) => {
@@ -574,6 +627,10 @@ const OLD_STATES: [string, Record<string, unknown>][] = [
   ['ada-3', { stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'repo', reaction: 'Old words.', mood: 'idle',
     recordingFailed: false, lastTool: 'Bash', lastToolAt: 0, lastStatus: 'ok', running: 0, calls: [], callCount: 0, failedCount: 0,
     slowest: null, turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null, tests: null, editedSinceTests: false, git: null, pr: { kind: 'unknown' } }],
+  ['ada-4', { stats: null, statsAt: 0, statsNote: '', refreshing: false, view: 'repo', reaction: 'Old words.', mood: 'idle',
+    recordingFailed: false, lastTool: 'Bash', lastToolAt: 0, lastStatus: 'ok', running: 0, calls: [], callCount: 0, failedCount: 0,
+    slowest: null, turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: { ms: 5, calls: 1 }, tests: null, editedSinceTests: false,
+    git: null, pr: { kind: 'unknown' }, delivery: null, runs: null }],
 ]
 OLD_STATES.forEach(([shape, value], i) => test(`state an earlier build kept under ${shape} is reset, not read`, async ($, on) => {
   world(on, { now: 190_000_000 + i * 1_000_000, repo: null })
@@ -1121,6 +1178,10 @@ const REPO_STATE = {
   recordingFailed: false, lastTool: '', lastToolAt: 0, lastStatus: '', running: 0, calls: [], callCount: 0, failedCount: 0,
   slowest: null, turnStartedAt: 0, turnCalls: 0, tick: 0, lastTurn: null, tests: null, editedSinceTests: false,
   git: null, pr: { kind: 'none' }, delivery: null, runs: null,
+  stage: 'idle', model: '', effort: '', steps: [], stepCount: 0, loopCalls: 0, loopTool: '', loopRunning: 0,
+  turnTokens: { fresh: 0, cached: 0, written: 0, out: 0 }, sessionTokens: { fresh: 0, cached: 0, written: 0, out: 0 },
+  helperTokens: { fresh: 0, cached: 0, written: 0, out: 0 }, helpersStarted: 0, toolCounts: [],
+  handoffs: { sent: 0, running: 0, back: 0, failed: 0, backends: [] }, contextParts: null,
 }
 
 const WATCH_PAGE = '<!doctype html><title>Runs · hrn watch</title>'
@@ -1216,8 +1277,10 @@ NO_LINK_ROOM.forEach(([name, extra], i) => test(`the watch is not asked when ${n
 
 test('a watch that answered is not linked once the option names another address', async ($, on) => {
   const w = world(on, { now: 690_000_000, store: { view: 'repo' }, page: () => ({ status: 200, text: WATCH_PAGE }) })
-  on('state.get', () => ({ value: { value: { shape: 'ada-4', value: { ...REPO_STATE, watch: 'http://127.0.0.1:9999/' } }, version: 1 } }))
+  on('state.get', () => ({ value: { value: { shape: 'ada-5', value: { ...REPO_STATE, watch: 'http://127.0.0.1:9999/' } }, version: 1 } }))
   const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  // The kept state is read: its view is the one drawn.
+  expect((await ui.find({ key: 'view-repo' }))?.props.variant).toBe('primary')
   expect((await ui.findAll({ type: 'Link' })).some(l => l.props.label === 'Watch')).toBe(false)
   await ui.unmount()
   expect(w.fetched).toEqual([])
@@ -1324,18 +1387,513 @@ test('every picture is drawn at the size its markup declares, so the strip stays
   expect(svgSize('<svg viewBox="0 0 10 10"></svg>')).toEqual([undefined, undefined])
 })
 
+// ---- The agent's loop ----
+
+test('a tool is named without its server, and a response by how it ended', () => {
+  expect(shortTool('Bash')).toBe('Bash')
+  expect(shortTool('mcp__hrn__run')).toBe('run')
+  expect(shortTool('mcp__plugin_x__list__all')).toBe('list__all')
+  expect(shortTool('mcp__')).toBe('mcp__')
+  expect(shortTool('<b>Bad name</b>')).toBe('bBadnameb')
+  expect(shortTool('')).toBe('tool')
+  expect(shortTool('a'.repeat(60)).length).toBe(24)
+  expect(['tool_use', 'end_turn', 'stop_sequence', 'max_tokens', 'model_context_window_exceeded', 'refusal', 'pause_turn', 'compaction', null, undefined, 'new'].map(stopWord))
+    .toEqual(['tools', 'answer', 'answer', 'cut', 'cut', 'refused', 'paused', 'paused', 'none', 'none', 'none'])
+  const asked = askedFor([{ name: 'Grep' }, { name: 'Read' }, { name: 'Read' }, { name: 'mcp__hrn__run' }, { name: 'Edit' }, { name: 'Write' }, {}])
+  expect(asked).toEqual([{ tool: 'Read', count: 2 }, { tool: 'Grep', count: 1 }, { tool: 'run', count: 1 }, { tool: 'Edit', count: 1 }])
+  expect(askedFor(undefined)).toEqual([])
+  expect(stepLine({ index: 0, stop: 'tools', tools: asked.slice(0, 2), out: 0 })).toBe('asked for Read ×2, Grep')
+  expect((['tools', 'answer', 'cut', 'refused', 'paused', 'none'] as const).map(stop => stepLine({ index: 0, stop, tools: [], out: 0 })))
+    .toEqual(['asked for tools', 'answered', 'ran out of room', 'refused', 'paused', 'no response'])
+})
+
+test('tokens add up, and the cache’s share is of what was read', () => {
+  const none = { fresh: 0, cached: 0, written: 0, out: 0 }
+  expect(addTokens(none, null)).toEqual(none)
+  const one = addTokens(none, spent(100, 800, 100, 40))
+  expect(one).toEqual({ fresh: 100, cached: 800, written: 100, out: 40 })
+  expect(addTokens(one, { input_tokens: 5, output_tokens: NaN })).toEqual({ fresh: 105, cached: 800, written: 100, out: 40 })
+  expect(cacheShare(one)).toBe(80)
+  expect(cacheShare(none)).toBe(null)
+  expect(cacheShare({ fresh: 10, cached: 0, written: 0, out: 5 })).toBe(0)
+})
+
+test('calls are counted per tool, most called first', () => {
+  let counts: { tool: string; count: number }[] = []
+  for (const tool of ['Read', 'Bash', 'Bash', 'mcp__hrn__run', 'Bash', 'Read']) counts = countTool(counts, tool)
+  expect(counts).toEqual([{ tool: 'Bash', count: 3 }, { tool: 'Read', count: 2 }, { tool: 'run', count: 1 }])
+  expect(toolMix(counts)).toBe('Bash 3, Read 2, run 1')
+  expect(toolMix(counts, 1)).toBe('Bash 3')
+  for (let i = 0; i < 40; i++) counts = countTool(counts, `T${i}`)
+  expect(counts.length).toBe(24)
+  expect(counts[0]).toEqual({ tool: 'Bash', count: 3 })
+})
+
+test('a call that hands a task to hrn is known by the tool or the command’s first words', () => {
+  expect(handoff('mcp__hrn__run', { task: 'secret', backend: 'codex' })).toEqual({ backend: 'codex', waits: true })
+  expect(handoff('mcp__hrn__batch', {})).toEqual({ backend: '', waits: true })
+  // A submitted job answers at once: its end is another tool's to ask for.
+  expect(handoff('mcp__hrn__remote_submit', { backend: 'api' })).toEqual({ backend: 'api', waits: false })
+  expect(handoff('mcp__hrn__run', { backend: 'Not a backend; rm -rf' })).toEqual({ backend: '', waits: true })
+  expect(handoff('mcp__hrn__runs', {})).toBe(null)
+  expect(handoff('mcp__hrn__show', {})).toBe(null)
+  expect(handoff('mcp__other__run', {})).toBe(null)
+  expect(handoff('Bash', { command: 'hrn run -b claude "fix the thing"' })).toEqual({ backend: 'claude', waits: true })
+  expect(handoff('Bash', { command: 'cd /work && HRN_HOME=/x hrn batch tasks.json --backend=agy' })).toEqual({ backend: 'agy', waits: true })
+  expect(handoff('PowerShell', { command: 'hrn.exe flow plan.json' })).toEqual({ backend: '', waits: true })
+  expect(handoff('Bash', { command: 'hrn run -b codex x', run_in_background: true })).toEqual({ backend: 'codex', waits: false })
+  // A word of the task, or of the next command, is never taken for a backend.
+  expect(handoff('Bash', { command: 'hrn run "rename the -b flag in parser"' })).toEqual({ backend: '', waits: true })
+  expect(handoff('Bash', { command: "hrn run 'use --backend secret here'" })).toEqual({ backend: '', waits: true })
+  expect(handoff('Bash', { command: 'hrn run task.md && deploy --backend secret' })).toEqual({ backend: '', waits: true })
+  expect(handoff('Bash', { command: 'hrn run task.md; other -b secret' })).toEqual({ backend: '', waits: true })
+  expect(handoff('Bash', { command: 'hrn run task.md | tee -b secret' })).toEqual({ backend: '', waits: true })
+  expect(handoff('Bash', { command: 'hrn run --backend gemini task.md; echo done' })).toEqual({ backend: 'gemini', waits: true })
+  expect(handoff('Bash', { command: 'hrn runs --json' })).toBe(null)
+  expect(handoff('Bash', { command: 'hrn bot stats' })).toBe(null)
+  expect(handoff('Bash', { command: 'echo hrn run -b codex' })).toBe(null)
+  expect(handoff('Bash', {})).toBe(null)
+  expect(handoff('Read', { command: 'hrn run x' })).toBe(null)
+})
+
+const BREAKDOWN = {
+  categories: [
+    { name: 'System prompt', tokens: 4000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'Messages', tokens: 90000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'System tools', tokens: 20000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'MCP tools', tokens: 12000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'Memory\nfiles', tokens: 6000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'Skills', tokens: 3000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'Custom agents', tokens: 1000, color: 'a', isDeferred: false, kind: 'used' },
+    { name: 'MCP tools (deferred)', tokens: 50000, color: 'a', isDeferred: true, kind: 'deferred' },
+    { name: 'Free space', tokens: 31000, color: 'a', isDeferred: false, kind: 'free' },
+    { name: 'Autocompact buffer', tokens: 33000, color: 'a', isDeferred: false, kind: 'buffer' },
+    { name: 'Empty', tokens: 0, color: 'a', isDeferred: false, kind: 'used' },
+    'not a row',
+  ],
+}
+
+test('the context by category: largest first, the small ones together, what is outside the window left out', () => {
+  expect(parseContextParts(BREAKDOWN)).toEqual([
+    { name: 'Messages', tokens: 90000, kind: 'used' }, { name: 'System tools', tokens: 20000, kind: 'used' },
+    { name: 'MCP tools', tokens: 12000, kind: 'used' }, { name: 'Memory files', tokens: 6000, kind: 'used' },
+    { name: 'System prompt', tokens: 4000, kind: 'used' }, { name: 'Other', tokens: 4000, kind: 'used' },
+    { name: 'Autocompact buffer', tokens: 33000, kind: 'buffer' }, { name: 'Free space', tokens: 31000, kind: 'free' },
+  ])
+  expect(parseContextParts(undefined)).toBe(null)
+  expect(parseContextParts({ categories: 'none' })).toBe(null)
+  expect(parseContextParts({ categories: [] })).toBe(null)
+})
+
+test('what the loop is doing reads as one sentence', () => {
+  const idle = { stage: 'idle' as const, stepCount: 0, turnStartedAt: 0, loopTool: '', loopRunning: 0, lastTurn: null, loopCalls: 0 }
+  expect(stageLine(idle)).toBe('Waiting for a prompt.')
+  expect(stageLine({ ...idle, turnStartedAt: 5, stage: 'model' })).toBe('Request 1: the model reads the conversation and decides what to do.')
+  expect(stageLine({ ...idle, turnStartedAt: 5, stage: 'model', stepCount: 3, loopCalls: 4 })).toBe('Request 3: the model reads the results and decides what to do next.')
+  expect(stageLine({ ...idle, turnStartedAt: 5, stage: 'tools', loopTool: 'mcp__hrn__run', loopRunning: 1 })).toBe('Running run; the results go back to the model.')
+  expect(stageLine({ ...idle, turnStartedAt: 5, stage: 'tools', loopTool: 'Read', loopRunning: 3 })).toBe('Running Read and 2 more; the results go back to the model.')
+  // The turn's size is the main loop's: a helper's 30 calls are not its own.
+  expect(stageLine({ ...idle, lastTurn: { ms: 1, calls: 31, steps: 2, loopCalls: 1, stopped: false } })).toBe('The last turn took 2 requests and 1 tool call.')
+  expect(stageLine({ ...idle, lastTurn: { ms: 1, calls: 3, steps: 1, loopCalls: 3, stopped: true } })).toBe('The last turn was stopped after 1 request and 3 tool calls.')
+  expect(countKinds(['Explore', 'general-purpose', 'Explore', 'a b', 'x', 'y'])).toBe('Explore 2, general-purpose 1, other 1')
+  expect(countKinds([])).toBe('')
+})
+
+test('the loop’s picture: four stations, a lane for hrn when it is here, hollow until a task is sent', () => {
+  const stations: Station[] = [
+    { label: 'You', line: 'prompt', state: 'done' }, { label: 'Model', line: '3 requests', state: 'now' },
+    { label: 'Tools', line: '<script>4 calls', state: 'done' }, { label: 'Answer', line: '0:12', state: 'idle' },
+  ]
+  const lane = (state: Station['state']): Station[] => [
+    { label: 'hrn', line: '1 task', state }, { label: 'Backend', line: 'codex', state }, { label: 'Result', line: 'comes back', state: 'idle' },
+  ]
+  const alone = loopPicture(stations, null)
+  expect(svgSize(alone)).toEqual([320, 34])
+  expect((alone.match(/<rect /g) ?? []).length).toBe(4)
+  expect(alone.includes('#C24A22')).toBe(true)
+  expect(alone.includes('>script4 calls</text>')).toBe(true)
+  const unused = loopPicture(stations, lane('idle'))
+  expect(svgSize(unused)).toEqual([320, 84])
+  expect((unused.match(/<rect /g) ?? []).length).toBe(7)
+  expect((unused.match(/fill="none" stroke="#8a94a3" stroke-dasharray="3 2"\/>/g) ?? []).length).toBe(3)
+  expect(loopPicture(stations, lane('done')).includes('fill="none" stroke="#8a94a3" stroke-dasharray="3 2"/>')).toBe(false)
+  for (const svg of [alone, unused, stack([{ value: 1, fill: '#111' }], 'a <b> & c')]) {
+    expect(svg.startsWith('<svg ')).toBe(true)
+    expect(/<script|on\w+=|href=|<b>/i.test(svg)).toBe(false)
+  }
+})
+
+test('a bar split by share fills its length, as a picture and as blocks', () => {
+  const parts = [{ value: 60, fill: '#1' }, { value: 30, fill: '#2' }, { value: 0, fill: '#3' }, { value: 10, fill: '#4', faint: true }]
+  const svg = stack(parts, 'shares')
+  expect(svgSize(svg)).toEqual([320, 10])
+  expect([...svg.matchAll(/<rect x="(\d+)" y="0" width="(\d+)"/g)].map(m => [Number(m[1]), Number(m[2])])).toEqual([[0, 191], [192, 95], [288, 31]])
+  expect((svg.match(/fill-opacity="0.5"/g) ?? []).length).toBe(1)
+  expect(stackRuns(parts, 10)).toEqual([{ text: '██████', fill: '#1', faint: false }, { text: '███', fill: '#2', faint: false }, { text: '░', fill: '#4', faint: true }])
+  expect(stackRuns(parts).map(r => r.text).join('').length).toBe(30)
+  expect(stackRuns([{ value: 0, fill: '#1' }])).toEqual([])
+  expect(stack([], 'none').includes('<rect')).toBe(false)
+  expect(strip([]).includes('stroke-dasharray="4 2"')).toBe(true)
+})
+
+test('the agent view follows a turn: the stage, each request, the tokens and the model, on every surface', async ($, on) => {
+  const w = world(on, {
+    now: 760_000_000, store: { view: 'agent' },
+    step: index => (index === 0
+      ? { toolUses: [{ name: 'Read', input: { file_path: '/secret/a' } }, { name: 'Read', input: {} }, { name: 'Grep', input: { pattern: 'secret' } }], stopReason: 'tool_use', usage: spent(1000, 8000, 1000, 1200) }
+      : { stopReason: 'end_turn', usage: spent(500, 9500, 0, 310) }),
+  })
+  let hold = false
+  let finish: () => void = () => {}
+  on('tool.call', () => (hold ? new Promise<{ result: object }>(resolve => { finish = () => resolve({ result: {} }) }) : { result: {} }))
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  await $.prompt.submit(typed('secret prompt'))
+  await $.turn.start(turnBegins())
+  await request($, w, 0)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect((await ui.find({ key: 'view-agent' }))?.props.variant).toBe('primary')
+    expect(all.includes('Thinking')).toBe(true)
+    expect(all.includes('claude-fable-5-2, high effort')).toBe(true)
+    expect(all.includes('Request 1: the model reads the conversation and decides what to do.')).toBe(true)
+    expect(all.includes('This turn, request by request')).toBe(true)
+    expect(all.includes('asked for Read ×2, Grep')).toBe(true)
+    expect(all.includes('1k written')).toBe(true)
+    expect(all.includes('What the model read this turn')).toBe(true)
+    expect(all.includes('80% came from the cache')).toBe(true)
+    expect(all.includes('From the cache')).toBe(true)
+    expect(all.includes('secret')).toBe(false)
+    const pictures = (await ui.findAll({ type: 'Svg' })).map(x => [x.props.width, x.props.height])
+    expect(pictures).toEqual(surface === 'terminal' ? [] : [[46, 46], [320, 34], [320, 10]])
+    if (surface === 'terminal') expect(all.includes('You (prompt)')).toBe(true)
+    await ui.unmount()
+  }
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  // A call in flight puts the loop at the tools.
+  hold = true
+  const call = $.tool.call({ tool: 'Read', file_path: '/secret/a' })
+  await w.clock.settle()
+  expect((await texts(ui)).includes('Using tools')).toBe(true)
+  expect((await texts(ui)).includes('Running Read; the results go back to the model.')).toBe(true)
+  finish()
+  await call
+  await request($, w, 1)
+  expect((await texts(ui)).includes('Request 2: the model reads the results and decides what to do next.')).toBe(true)
+  expect((await texts(ui)).includes(' 2 answered, 310 written')).toBe(true)
+  await $.turn.complete(turnDone(12000))
+  await w.clock.settle()
+  const after = await texts(ui)
+  expect(after.includes('Answered')).toBe(true)
+  expect(after.includes('The last turn took 2 requests and 1 tool call.')).toBe(true)
+  expect(after.includes('Last turn, request by request')).toBe(true)
+  expect(after.includes('What the model read last turn')).toBe(true)
+  expect(after.includes('88% came from the cache')).toBe(true)
+  expect(after.includes('This session: 20k read, 2k written.')).toBe(true)
+  expect(after.includes('secret')).toBe(false)
+  // The next turn starts its own list.
+  await $.turn.start(turnBegins())
+  expect((await texts(ui)).includes('request by request')).toBe(false)
+  await ui.unmount()
+})
+
+test('only the newest eight requests of a turn are listed, with a count of the earlier ones', async ($, on) => {
+  const w = world(on, { now: 765_000_000, store: { view: 'agent' }, step: () => ({ toolUses: [{ name: 'Read', input: {} }], stopReason: 'tool_use' }) })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await $.turn.start(turnBegins())
+  for (let i = 0; i < 11; i++) await request($, w, i)
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  const all = await texts(ui)
+  expect(all.includes('3 earlier requests')).toBe(true)
+  expect((all.match(/asked for Read/g) ?? []).length).toBe(8)
+  expect(all.includes('Request 11')).toBe(true)
+  await ui.unmount()
+})
+
+test('a helper’s requests are counted as the helpers’, never listed as the turn’s', async ($, on) => {
+  const w = world(on, {
+    now: 770_000_000, store: { view: 'agent' },
+    step: (_, agentId) => (agentId ? { toolUses: [{ name: 'Grep', input: {} }], stopReason: 'tool_use', usage: spent(2000, 1000, 0, 700) } : { stopReason: 'tool_use', toolUses: [{ name: 'Agent', input: { prompt: 'secret task' } }] }),
+    agents: [
+      { id: 'a1', type: 'Explore', status: 'running', description: 'secret task', label: 'secret label' },
+      { id: 'a2', type: 'Explore', status: 'completed', description: 'secret task', label: 'secret label' },
+      { id: 'a3', type: 'general-purpose', status: 'waiting', description: 'secret task', label: 'secret label' },
+    ],
+  })
+  on('tool.call', () => ({ result: {} }))
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  await $.turn.start(turnBegins())
+  await request($, w, 0)
+  await $.tool.call({ tool: 'Agent', prompt: 'secret task', description: 'secret', subagent_type: 'Explore' })
+  await $.turn.start(turnBegins({ agentId: 'a1' }))
+  await request($, w, 0, { agentId: 'a1' })
+  // A compaction or memory pass is the engine's own loop: what it reads is not a helper's.
+  await request($, w, 0, { agentId: 'fork-9' })
+  // A helper's call does not move the main loop off the model.
+  await request($, w, 1)
+  await $.tool.call({ tool: 'Grep', pattern: 'secret', agentId: 'a1' } as never)
+  await $.tool.call({ tool: 'Grep', pattern: 'secret', agentId: 'a1' } as never)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect(all.includes('Thinking')).toBe(true)
+    expect(all.includes('Request 2: the model reads the results and decides what to do next.')).toBe(true)
+    expect(all.includes(surface === 'terminal' ? 'Tools (1 call)' : 'They read')).toBe(true)
+    expect(all.includes('asked for Grep')).toBe(false)
+    expect(all.includes('asked for Agent')).toBe(true)
+    expect(all.includes('2 running, 3 started this session')).toBe(true)
+    expect(all.includes('Explore 2, general-purpose 1')).toBe(true)
+    expect(all.includes('They read 3k and wrote 700.')).toBe(true)
+    expect(all.includes('secret')).toBe(false)
+    await ui.unmount()
+  }
+  await $.turn.complete(turnDone(4000))
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await texts(ui)).includes('The last turn took 2 requests and 1 tool call.')).toBe(true)
+  await ui.press({ key: 'view-session' })
+  // The session view counts every call of the turn, a helper's too.
+  expect((await texts(ui)).includes('3 tool calls')).toBe(true)
+  await ui.unmount()
+})
+
+test('a request’s pieces pass through in order and its result is what the model gave', async ($, on) => {
+  const chunks = [{ kind: 'text' as const, index: 0, text: 'one ' }, { kind: 'text' as const, index: 0, text: 'two' }]
+  const w = world(on, { now: 772_000_000, chunks, step: () => ({ answer: 'one two', stopReason: 'end_turn', usage: spent(1, 2, 3, 4) }) })
+  await $.turn.start(turnBegins())
+  const got = await request($, w, 0)
+  expect(got.chunks).toEqual(chunks)
+  expect(got.result).toEqual({ turnId: 't1', index: 0, answer: 'one two', toolUses: [], stopReason: 'end_turn', usage: spent(1, 2, 3, 4) })
+})
+
+test('a request that fails still fails for its caller, and a stopped turn is not drawn as answered', async ($, on) => {
+  const w = world(on, { now: 773_000_000, store: { view: 'agent' }, step: () => { throw new Error('overloaded') } })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  await $.turn.start(turnBegins())
+  let failed = false
+  try { await request($, w, 0) } catch { failed = true }
+  expect(failed).toBe(true)
+  await $.turn.complete(turnDone(2000, { isAborted: true }))
+  await w.clock.settle()
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect(all.includes('Stopped')).toBe(true)
+    expect(all.includes('Answered')).toBe(false)
+    expect(all.includes('The last turn was stopped after 1 request and 0 tool calls.')).toBe(true)
+    expect(all.includes('request by request')).toBe(false)
+    if (surface === 'terminal') expect(all.includes('Answer (stopped)')).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('a request goes through though the pane cannot keep what it saw', async ($, on) => {
+  let refuse = false
+  const w = world(on, { now: 774_000_000, step: () => ({ answer: 'fine', stopReason: 'end_turn', usage: spent(1, 2, 3, 4) }) })
+  on('state.set', (_, e, next) => (refuse ? { deny: 'no room' } : next(e)))
+  await $.turn.start(turnBegins())
+  refuse = true
+  const got = await request($, w, 0)
+  expect(got.result.answer).toBe('fine')
+  refuse = false
+})
+
+test('calls side by side: on it while one still runs, thinking once the last is back', async ($, on) => {
+  const w = world(on, { now: 776_000_000 })
+  const waiting: (() => void)[] = []
+  on('tool.call', () => new Promise<{ result: object }>(resolve => { waiting.push(() => resolve({ result: {} })) }))
+  await $.turn.start(turnBegins())
+  const first = $.tool.call({ tool: 'Read', file_path: '/a' })
+  const second = $.tool.call({ tool: 'Grep', pattern: 'x' })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  await ui.press({ key: 'view-agent' })
+  expect((await texts(ui)).includes('Running Grep and 1 more; the results go back to the model.')).toBe(true)
+  waiting[0]?.()
+  await first
+  await ui.press({ key: 'view-session' })
+  expect((await texts(ui)).includes('On it.')).toBe(true)
+  waiting[1]?.()
+  await second
+  expect((await texts(ui)).includes('Thinking it over.')).toBe(true)
+  await ui.unmount()
+})
+
+test('the context is broken down only while the agent view is on screen, at most once a minute', async ($, on) => {
+  const cfg: World = { now: 775_000_000, breakdown: BREAKDOWN }
+  const w = world(on, cfg)
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.breakdowns).toEqual([])
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  await ui.press({ key: 'view-agent' })
+  expect(w.breakdowns).toEqual(['summary'])
+  expect(w.store.get('view')).toBe('agent')
+  const all = await texts(ui)
+  expect(all.includes('What fills the context')).toBe(true)
+  expect(all.includes('Messages')).toBe(true)
+  expect(all.includes('90k')).toBe(true)
+  expect(all.includes('Autocompact buffer')).toBe(true)
+  expect(all.includes('deferred')).toBe(false)
+  expect((await ui.findAll({ type: 'Svg' })).some(x => String(x.props.alt) === 'The context window by what fills it')).toBe(true)
+  await w.clock.advance(30000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.breakdowns.length).toBe(1)
+  await w.clock.advance(31000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.breakdowns.length).toBe(2)
+  cfg.shown = false
+  await w.clock.advance(61000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.breakdowns.length).toBe(2)
+  cfg.shown = true
+  await ui.press({ key: 'view-session' })
+  await w.clock.advance(61000)
+  await $.turn.complete(turnDone(1000))
+  await w.clock.settle()
+  expect(w.breakdowns.length).toBe(2)
+  await ui.unmount()
+})
+
+test('a session that gives no breakdown draws the agent view without that section', async ($, on) => {
+  const w = world(on, { now: 778_000_000, store: { view: 'agent' } })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect(w.breakdowns).toEqual(['summary'])
+  expect((await texts(ui)).includes('What fills the context')).toBe(false)
+  expect((await texts(ui)).includes('The loop')).toBe(true)
+  await ui.unmount()
+})
+
+test('tasks handed to hrn are counted by their result, and the lane lights up', async ($, on) => {
+  const w = world(on, { now: 780_000_000, store: { view: 'agent' }, hrn: () => cannotStart('hrn') })
+  let fail = false
+  on('tool.call', () => (fail ? { result: {}, isError: true as const } : { result: {} }))
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const alone = await $.ui.mount({ ...pane, surface: 'desktop' })
+  // Without hrn the picture is the session alone.
+  expect((await alone.findAll({ type: 'Svg' })).map(x => x.props.height)).toEqual([46, 34])
+  await alone.unmount()
+  await $.tool.call({ tool: 'mcp__hrn__run', task: 'secret task', backend: 'codex' } as never)
+  fail = true
+  await $.tool.call({ tool: 'Bash', command: 'hrn run -b claude "secret task"' })
+  fail = false
+  await $.tool.call({ tool: 'Bash', command: 'hrn batch secret.json', run_in_background: true })
+  await $.tool.call({ tool: 'Bash', command: 'hrn runs --json' })
+  await $.tool.call({ tool: 'Bash', command: 'hrn run "rename the -b flag in secret"' })
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect(all.includes('4 tasks handed over: 2 came back, 1 failed')).toBe(true)
+    expect(all.includes('On codex, claude')).toBe(true)
+    expect(all.includes('secret')).toBe(false)
+    if (surface === 'desktop') expect((await ui.findAll({ type: 'Svg' })).map(x => x.props.height)).toEqual([46, 84])
+    else expect(all.includes('hrn (4 tasks)')).toBe(true)
+    await ui.unmount()
+  }
+})
+
+test('a refused hrn call hands nothing over, a submitted job is not waited for, and a call that never answers is not left running', async ($, on) => {
+  const w = world(on, { now: 782_000_000, store: { view: 'agent' } })
+  let answer: 'ok' | 'deny' | 'throw' = 'deny'
+  on('tool.call', () => {
+    if (answer === 'throw') throw new Error('lost')
+    return answer === 'deny' ? { deny: 'not allowed' } : { result: {} }
+  })
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  await $.tool.call({ tool: 'mcp__hrn__run', task: 'x', backend: 'codex' } as never)
+  const ui = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await texts(ui)).includes('handed over')).toBe(false)
+  answer = 'ok'
+  await $.tool.call({ tool: 'mcp__hrn__remote_submit', task: 'x' } as never)
+  expect((await texts(ui)).includes('1 task handed over: not waited for')).toBe(true)
+  answer = 'throw'
+  let failed = false
+  try { await $.tool.call({ tool: 'mcp__hrn__run', task: 'x' } as never) } catch { failed = true }
+  expect(failed).toBe(true)
+  const all = await texts(ui)
+  expect(all.includes('2 tasks handed over: 1 failed')).toBe(true)
+  expect(all.includes('running')).toBe(false)
+  await ui.unmount()
+})
+
+test('inside a turn a finished call is not the end of it', async ($, on) => {
+  world(on, { now: 785_000_000 })
+  on('tool.call', () => ({ result: {} }))
+  await $.turn.start(turnBegins())
+  await $.tool.call({ tool: 'Read', file_path: '/a' })
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  let all = await texts(ui)
+  expect(all.includes('Thinking it over.')).toBe(true)
+  expect(all.includes('Done')).toBe(false)
+  expect(all.includes('Working')).toBe(true)
+  await $.turn.complete(turnDone(3000))
+  all = await texts(ui)
+  expect(all.includes('Done. What’s next?')).toBe(true)
+  expect(all.includes('Working')).toBe(false)
+  expect((all.match(/Done/g) ?? []).length).toBe(1)
+  await ui.unmount()
+})
+
+test('the session view names the tools called most', async ($, on) => {
+  world(on, { now: 788_000_000 })
+  on('tool.call', () => ({ result: {} }))
+  await $.tool.call({ tool: 'Read', file_path: '/a' })
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  // One tool alone says nothing the line above it does not.
+  expect((await texts(ui)).includes('Read 1')).toBe(false)
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect((await texts(ui)).includes('Bash 2, Read 1')).toBe(true)
+  await ui.unmount()
+})
+
+test('a branch read in a repository is not shown once the session stands outside one', async ($, on) => {
+  const cfg: World = { now: 790_000_000 }
+  const w = world(on, cfg)
+  await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(ui)).includes('pane-look, no changes')).toBe(true)
+  await ui.unmount()
+  cfg.repo = null
+  const outside = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(outside)).includes('pane-look')).toBe(false)
+  expect(await outside.find({ key: 'view-repo' })).toBeUndefined()
+  await outside.unmount()
+})
+
 // ---- Privacy ----
 
 test('nothing new reaches the recording file', async ($, on) => {
-  const w = world(on, { now: 250_000_000, git: () => ran(GIT_CHANGED), gh: () => ran(JSON.stringify(PR)), hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(runsWire(250_000_000))) })
+  const w = world(on, {
+    now: 250_000_000, git: () => ran(GIT_CHANGED), gh: () => ran(JSON.stringify(PR)), hrn: () => ran(JSON.stringify(repoWire)), runs: () => ran(JSON.stringify(runsWire(250_000_000))),
+    chunks: [{ kind: 'text', index: 0, text: 'secret answer' }],
+    step: () => ({ answer: 'secret answer', toolUses: [{ name: 'Bash', input: { command: 'cat /secret/file' } }], stopReason: 'tool_use', usage: spent(1, 2, 3, 4) }),
+  })
   on('tool.call', () => ({ result: {} }))
   await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
   await $.prompt.submit(typed('secret prompt'))
   await $.turn.start(turnBegins())
   await $.tool.call({ tool: 'Bash', command: 'go test ./secret/...' })
   await $.tool.call({ tool: 'Edit', file_path: '/secret/file', old_string: 'a', new_string: 'b' })
+  await request($, w, 0)
+  await $.tool.call({ tool: 'mcp__hrn__run', task: 'secret task', backend: 'codex' } as never)
   const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
   await ui.press({ key: 'view-repo' })
+  await ui.press({ key: 'view-agent' })
+  expect((await texts(ui)).includes('asked for Bash')).toBe(true)
+  expect((await texts(ui)).includes('secret')).toBe(false)
   await ui.unmount()
   await $.turn.complete(turnDone(4000))
   await w.clock.advance(20000)
@@ -1350,6 +1908,7 @@ test('nothing new reaches the recording file', async ($, on) => {
     { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'prompt' },
     { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'tool', tool: 'Bash', status: 'ok' },
     { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'tool', tool: 'Edit', status: 'ok' },
+    { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'tool', tool: 'mcp__hrn__run', status: 'ok' },
   ])
   expect(/secret|pane-look|Pane look|go test|ada-pane|harness|codex|claude,|r1|\.\.\/bad/.test([...w.files.values()].join(''))).toBe(false)
 })

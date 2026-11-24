@@ -169,7 +169,7 @@ How the agent works, drawn from what this session is doing. It needs nothing fro
 | Delivery here, strip, counts, top repositories | hrn, per repository (see below) | `$.store`, with age |
 | Runs here | hrn, per repository (see below) | state; every 30 seconds while a run is live and the Repo view is on screen |
 | Links | built from `$.session.repo.remote`; only `https://github.com/` remotes get links. `Watch`: the `watch_address` option, asked over loopback | the address that answered, state |
-| Game figures | `hrn bot stats --json`; the ledger it reads is kept current by the text form `hrn bot stats` (see Cost) | `$.store`, with age |
+| Game figures | `hrn bot stats --json`, which folds new runs into the ledger before it answers (see Cost) | `$.store`, with age |
 | Stage, model, effort | `turn.step` on the main loop (a request is about to go), the main loop's `tool.call` (the tools run), `turn.complete` (and whether the turn was stopped) | state |
 | Requests of the turn | each `turn.step` response: how it ended, the names of the tools it asked for, its output tokens | newest eight, state |
 | Tokens read and written | each response's usage, summed per turn and per session; apart, the requests of the loops `$.agent.list()` names as helpers | state |
@@ -186,7 +186,7 @@ Two additions to harness, one issue each, both small:
 
 1. `hrn bot stats --json --repo OWNER/NAME`: adds `repo: {week, days[35], kinds{}, share}`
    and `top: [{repo, week}]` (five entries, `owner/name` repositories only), and skips the
-   familiarity walk so it answers in well under a second. This also removes the pane's
+   familiarity walk so it answers in about a second. This also removes the pane's
    minute-long wait (harness#963).
 2. `hrn runs --json --repo OWNER/NAME -n N`: id, backend, status, started, duration.
 
@@ -220,7 +220,10 @@ hrn sections out, without an error.
 - hrn's per-repository answers: as `gh`, plus runs every 30 seconds while a run is live.
 - The watch address: as `gh`, with a two-second limit, and only while a terminal shows the
   pane in a repository with a GitHub remote.
-- No ledger rebuild: `hrn bot stats --json` folds new runs in itself before it answers.
+- No ledger rebuild: `hrn bot stats --json` folds new runs in itself before it answers, per
+  repository too (about a second on a home with 5,000 runs). One thing waits: practice XP for a
+  read whose pull request has since merged is credited by the text form `hrn bot stats` or the
+  next exercise, never by the pane.
 - The context by category: when the Agent view opens and after a turn ends while it is on
   screen, at most once a minute. It is an estimate made locally; no request is sent.
 - `turn.step` is the one event the pane hears on every model request. Its hook passes the

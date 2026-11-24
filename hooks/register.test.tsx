@@ -895,6 +895,8 @@ test('stats are asked per repository, with a short limit, where the session has 
   const stats = w.runs.filter(r => r.argv[1] === 'bot' && r.argv.includes('--json'))
   expect(stats.length).toBe(1)
   for (const run of stats) expect(run).toEqual({ argv: ['hrn', 'bot', 'stats', '--json', '--repo', REPO_NAME], cwd: undefined, timeoutMs: 8000 })
+  // With a repository too, hrn is only ever asked for JSON.
+  for (const run of w.runs.filter(r => r.argv[0] === 'hrn')) expect(run.argv.includes('--json')).toBe(true)
   expect((w.store.get('stats') as { delivery: { week: number } }).delivery.week).toBe(545)
 })
 

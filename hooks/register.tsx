@@ -23,7 +23,7 @@ const pane = atom({ plugin: 'ada-pane', key: 'pane' } as const, initial, { shape
 const STATS_ARGS = ['hrn', 'bot', 'stats', '--json'] as const
 const STATS_TIMEOUT_MS = 180000
 const STATS_EVERY_MS = 600000
-// Per repository hrn skips its slow walk and answers in well under a second; the spec gives it gh's limit.
+// Per repository hrn folds new runs and skips its slow walk, about a second in all; the spec gives it gh's limit.
 const REPO_STATS_TIMEOUT_MS = 8000
 const RUNS_TIMEOUT_MS = 8000
 const RUNS_LIVE_EVERY_MS = 30000
@@ -31,7 +31,6 @@ const RUNS_LIVE_EVERY_MS = 30000
 const STALE_RUN_MS = 6 * 3600000
 // How long to remember that the installed hrn refused a newer flag before asking again.
 const FLAG_RETRY_MS = 3600000
-// The text form folds new runs into the ledger the JSON form reads; it can take a minute.
 const GIT_TIMEOUT_MS = 3000
 const GIT_EVERY_MS = 10000
 const PR_TIMEOUT_MS = 8000

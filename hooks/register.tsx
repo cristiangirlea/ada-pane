@@ -95,18 +95,25 @@ async function change($: EngineInterface, fn: (s: AdaState) => AdaState) {
 // A clock that moved back (a new session's mocked or reset time) never holds a call back.
 const tooSoon = (now: number, at: number, every: number) => now >= at && now - at < every
 
+// What hrn names is drawn as text: no control characters, and no more than a short label.
+const clean = (text: string) => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 40)
+
+/** A program that could not be started at all, as against one that ran and failed or ran out of time. */
+const neverStarted = (err: unknown) => /ENOENT|not found|cannot start|could not start|no such file/i.test(err instanceof Error ? err.message : String(err))
+
 const whole = (value: unknown) => (typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0)
 
 /** What the pane keeps of hrn's answer; null when it is not one. */
 export function parseStats(text: string): { stats: Stats | null; note: string } {
   let raw: Record<string, unknown>
   try { raw = JSON.parse(text) } catch { return { stats: null, note: 'hrn gave no stats' } }
-  if (raw === null || typeof raw !== 'object') return { stats: null, note: 'hrn gave no stats' }
+  if (raw === null || typeof raw !== 'object' || raw.version !== 1) return { stats: null, note: 'hrn gave no stats' }
   if (raw.enabled === false) return { stats: null, note: 'The experience game is off in hrn' }
   if (typeof raw.level !== 'number' || typeof raw.xp !== 'number') return { stats: null, note: 'hrn gave no stats' }
   const week = (raw.week ?? {}) as Record<string, unknown>
   const ada = raw.ada as Record<string, unknown> | null | undefined
   const exercise = raw.exercise as Record<string, unknown> | null | undefined
+  const kind = exercise && typeof exercise.kind === 'string' ? clean(exercise.kind) : ''
   return {
     note: '',
     stats: {
@@ -115,19 +122,20 @@ export function parseStats(text: string): { stats: Stats | null; note: string } 
       streak: typeof raw.streak === 'number' ? whole(raw.streak) : null,
       week: { delivery: whole(week.delivery), practice: whole(week.practice) },
       days: Array.isArray(raw.days) ? raw.days.slice(-35).map(day => day === true) : [],
-      badges: Array.isArray(raw.badges) ? raw.badges.filter((b): b is string => typeof b === 'string').slice(0, 40) : [],
+      badges: Array.isArray(raw.badges) ? raw.badges.filter((b): b is string => typeof b === 'string').map(clean).filter(Boolean).slice(0, 40) : [],
       ada: ada ? { level: whole(ada.level), xpThisWeek: whole(ada.xp_this_week) } : null,
-      exercise: exercise && typeof exercise.kind === 'string' ? { kind: exercise.kind, answered: exercise.answered === true } : null,
+      exercise: exercise && kind ? { kind, answered: exercise.answered === true } : null,
     },
   }
 }
 
 async function refresh($: EngineInterface, force = false, every = STATS_EVERY_MS) {
+  // Taken before the first wait, so two callers at once cannot both start a reading.
+  if (statsBusy) return
+  statsBusy = true
   try {
     const now = await $.clock.now()
-    const state = await read($, pane)
-    if (statsBusy || state.refreshing || (!force && tooSoon(now, lastRefresh, every))) return
-    statsBusy = true
+    if (!force && tooSoon(now, lastRefresh, every)) return
     lastRefresh = now
     await change($, s => ({ ...s, refreshing: true }))
     const gh = githubRepo((await safely(() => $.session.repo()))?.remote)
@@ -153,7 +161,7 @@ async function refresh($: EngineInterface, force = false, every = STATS_EVERY_MS
         found = parseStats(result.stdout)
         if (asked) delivery = parseDelivery(result.stdout, name)
       }
-    } catch { found = { stats: null, note: 'hrn is not installed, or did not answer in time' } }
+    } catch (err) { found = { stats: null, note: neverStarted(err) ? 'hrn is not installed' : 'hrn did not answer in time' } }
     const at = await $.clock.now()
     if (found.stats) {
       const stats = found.stats
@@ -251,7 +259,7 @@ export function watchPage(address: unknown): string | null {
 export const isLive = (run: HrnRun, now: number) => run.status === 'running' && now - run.started < STALE_RUN_MS
 
 const toWire = (s: Stats) => ({
-  enabled: true, level: s.level, xp: s.xp, streak: s.streak, week: s.week, days: s.days, badges: s.badges,
+  version: 1, enabled: true, level: s.level, xp: s.xp, streak: s.streak, week: s.week, days: s.days, badges: s.badges,
   ada: s.ada && { level: s.ada.level, xp_this_week: s.ada.xpThisWeek }, exercise: s.exercise,
 })
 
@@ -331,7 +339,7 @@ export function parseGitStatus(text: string): GitStatus | null {
   if (!head) return null
   const detached = head === '(detached)'
   const short = /^[0-9a-f]{7,}$/.test(oid) ? oid.slice(0, 7) : 'an unknown commit'
-  return { head: detached ? `detached at ${short}` : head.slice(0, 120), detached, changed, ahead, behind }
+  return { head: detached ? `detached at ${short}` : head.replace(/[\u0000-\u001f\u007f-\u009f]/g, '').slice(0, 120), detached, changed, ahead, behind }
 }
 
 /** One entry of gh's `statusCheckRollup`: a check run or a commit status. */
@@ -389,8 +397,7 @@ export function readPullRequest(result: ProcessRunResult, repo: { owner: string;
 
 /** A `gh` that could not run: a start failure means it is missing; anything else hides the section. */
 export function readPullRequestFailure(err: unknown): PrReading {
-  const message = err instanceof Error ? err.message : String(err)
-  return /ENOENT|not found|cannot start|could not start|no such file/i.test(message) ? { kind: 'note', note: 'gh is not installed' } : { kind: 'hidden' }
+  return neverStarted(err) ? { kind: 'note', note: 'gh is not installed' } : { kind: 'hidden' }
 }
 
 /** `owner/name` as GitHub spells it: a name may start with a dot (`.github`) but is never `.` or `..`. */
@@ -807,6 +814,7 @@ const KIND_WORDS: Record<string, [string, string]> = {
   bug_squashed: ['bug squashed', 'bugs squashed'],
   script_reused: ['kept script reused', 'kept scripts reused'],
   routed_passed: ['routed run passed', 'routed runs passed'],
+  routed_failed: ['routed run failed', 'routed runs failed'],
   first_use: ['first use', 'first uses'],
 }
 
@@ -868,6 +876,7 @@ async function refreshGit($: EngineInterface) {
 
 async function refreshPr($: EngineInterface) {
   if (prBusy) return
+  prBusy = true
   try {
     const state = await read($, pane)
     if (state.view !== 'repo') return
@@ -878,7 +887,6 @@ async function refreshPr($: EngineInterface) {
     const gh = githubRepo(repo?.remote)
     if (!repo || !gh) { await change($, s => ({ ...s, pr: { kind: 'hidden' } })); return }
     prAt = now
-    prBusy = true
     let pr: PrReading
     try { pr = readPullRequest(await $.process.run(PR_ARGS, { timeoutMs: PR_TIMEOUT_MS }), gh) } catch (err) { pr = readPullRequestFailure(err) }
     await change($, s => ({ ...s, pr }))
@@ -887,6 +895,7 @@ async function refreshPr($: EngineInterface) {
 
 async function refreshRuns($: EngineInterface) {
   if (runsBusy) return
+  runsBusy = true
   try {
     const state = await read($, pane)
     if (state.view !== 'repo') return
@@ -898,7 +907,6 @@ async function refreshRuns($: EngineInterface) {
     const gh = githubRepo((await $.session.repo())?.remote)
     if (!gh) { await change($, s => ({ ...s, runs: null })); return }
     runsAt = now
-    runsBusy = true
     let runs: HrnRun[] | null = null
     try {
       const result = await $.process.run(['hrn', 'runs', '--json', '--repo', `${gh.owner}/${gh.name}`, '-n', '8'], { timeoutMs: RUNS_TIMEOUT_MS })
@@ -917,6 +925,7 @@ async function refreshRuns($: EngineInterface) {
 /** Which address answered as an hrn watch (its page's title ends in `· hrn watch`), or null. */
 async function refreshWatch($: EngineInterface) {
   if (watchBusy || !watchUrl) return
+  watchBusy = true
   try {
     const state = await read($, pane)
     if (state.view !== 'repo') return
@@ -927,7 +936,6 @@ async function refreshWatch($: EngineInterface) {
     const now = await $.clock.now()
     if (tooSoon(now, watchAt, PR_EVERY_MS)) return
     watchAt = now
-    watchBusy = true
     const url = watchUrl
     // A server that accepts and never answers must not hold the reading.
     const answer = await Promise.race([
@@ -1020,6 +1028,8 @@ export const register: Register = (on, options) => {
     try { void $.ui.open({ id: 'ada', title: 'Ada' }).catch(() => {}) } catch {}
     // A reload mid-turn keeps the running time moving.
     if ((await safely(() => read($, pane)))?.turnStartedAt) startTicker($)
+    // No reading outlives a reload: one marked as running would hold “Asking…” on show.
+    await change($, s => (s.refreshing ? { ...s, refreshing: false } : s))
     void recall($).then(async () => {
       await refreshGit($)
       await refreshRepo($)
@@ -1201,9 +1211,7 @@ export const register: Register = (on, options) => {
     const context = contextPercent(usage)
     const stats = state.stats
     const span = stats ? levelSpan(stats.level, stats.xp) : null
-    const statsLine = state.refreshing
-      ? (stats ? `Asking hrn again; read ${age(now, state.statsAt)}` : 'Reading your stats')
-      : state.statsNote || (stats ? `Read ${age(now, state.statsAt)}` : 'Reading your stats')
+    const statsLine = (!state.refreshing && state.statsNote) || 'Reading your stats'
     const pr = state.pr.kind === 'found' ? state.pr.pr : null
     const checks = pr ? {
       passed: pr.checks.filter(c => c === 'passed').length,
@@ -1252,7 +1260,7 @@ export const register: Register = (on, options) => {
       under = stats && span ? `${grouped(stats.xp)} XP, ${grouped(span.toGo)} to level ${stats.level + 1}` : ''
       right = (
         <Box flexDirection="column" alignItems="flex-end">
-          <Text size="caption" dimColor>{state.refreshing ? 'Asking…' : stats ? age(now, state.statsAt) : ''}</Text>
+          <Text size="caption" dimColor>{state.refreshing ? (stats ? `Asking… read ${age(now, state.statsAt)}` : 'Asking…') : stats ? age(now, state.statsAt) : ''}</Text>
           <Button key="refresh" label="Refresh" plain dimColor={state.refreshing} onPress={() => { void refresh($, true) }} />
         </Box>
       )
@@ -1539,6 +1547,7 @@ export const register: Register = (on, options) => {
             <Box flexDirection="column">
               <Progress label="Delivery" value={stats.week.delivery} max={top} valueText={`${grouped(stats.week.delivery)} XP`} color="success" />
               <Progress label="Practice" value={stats.week.practice} max={top} valueText={`${grouped(stats.week.practice)} XP`} color="success" />
+              {stats.ada && <Text size="caption" dimColor>Ada: level {stats.ada.level}, {grouped(stats.ada.xpThisWeek)} XP this week</Text>}
             </Box>
           ))}
           {section('Practice', (

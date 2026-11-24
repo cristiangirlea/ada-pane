@@ -196,7 +196,9 @@ hrn sections out, without an error.
 ## Privacy
 
 - Recording to `~/.hrn/claude-sessions` does not change: event metadata only.
-- New readings live in the session's state and are never written to a file. The test check
+- New readings live in the session's state. Of them only the stats and this repository's
+  delivery (its `owner/name`, its counts by kind and the week's top five repository names) are
+  kept between sessions, in the mod's own store; nothing else is written to a file. The test check
   looks at a command's first words to name the runner and keeps the runner's name only. Of a
   model request the pane keeps how it ended, tool names and token counts: never its text, its
   thinking or a tool's arguments. Of a helper it keeps the type and status, never its task or

@@ -66,7 +66,7 @@ type World = {
   git?: () => Answer
   gh?: () => Answer
   /** `hrn bot stats`; the arguments say whether it was asked per repository. */
-  hrn?: (argv: string[]) => Answer
+  hrn?: (argv: string[]) => Answer | Promise<Answer>
   /** `hrn runs`; unset answers as an hrn without --json does. */
   runs?: (argv: string[]) => Answer
   store?: Record<string, unknown>
@@ -262,6 +262,7 @@ test('git status: clean, changed, ahead and behind, detached, not a repository',
   expect(parseGitStatus('# branch.oid 0123456789abcdef\r\n# branch.head (detached)\r\n1 .M N... a b c d e f\r\n'))
     .toEqual({ head: 'detached at 0123456', detached: true, changed: 1, ahead: null, behind: null })
   expect(parseGitStatus('# branch.oid (initial)\n# branch.head main\n')).toEqual({ head: 'main', detached: false, changed: 0, ahead: null, behind: null })
+  expect(parseGitStatus('# branch.oid 0123456789abcdef\n# branch.head fix\u009b2J-it\n')?.head).toBe('fix2J-it')
   expect(parseGitStatus('')).toBe(null)
   expect(parseGitStatus('fatal: not a git repository (or any of the parent directories): .git')).toBe(null)
 })
@@ -350,6 +351,12 @@ test('what hrn answers is read with care', () => {
   expect(stats?.ada).toBe(null)
   expect(stats?.days.length).toBe(35)
   expect(stats?.badges).toEqual(['One'])
+  expect(parseStats(JSON.stringify({ ...wire, version: 2 }))).toEqual({ stats: null, note: 'hrn gave no stats' })
+  expect(parseStats(JSON.stringify({ ...wire, version: undefined })).stats).toBe(null)
+  const odd = parseStats(JSON.stringify({ ...wire, badges: ['Bud\u001b[31mget', '\u0007', 'x'.repeat(60)], exercise: { kind: 'cold\u009b2J read', answered: true } })).stats
+  expect(odd?.badges).toEqual(['Bud[31mget', 'x'.repeat(40)])
+  expect(odd?.exercise).toEqual({ kind: 'cold2J read', answered: true })
+  expect(parseStats(JSON.stringify({ ...wire, exercise: { kind: '\u0007' } })).stats?.exercise).toBe(null)
 })
 
 test('the pictures are plain markup with no script, and the ring fills to its percentage', () => {
@@ -581,7 +588,14 @@ const STATES: Case[] = [
   } },
   { name: 'usage not known yet', w: { usage: null }, view: 'session', check: all => { expect(all.includes('not known yet')).toBe(true) } },
   { name: 'game off', w: { hrn: () => ran('{"version":1,"enabled":false}') }, view: 'you', check: all => { expect(all.includes('The experience game is off in hrn')).toBe(true) } },
-  { name: 'hrn not installed', w: { hrn: () => cannotStart('hrn') }, view: 'you', check: all => { expect(all.includes('hrn is not installed')).toBe(true) } },
+  { name: 'hrn not installed', w: { hrn: () => cannotStart('hrn') }, view: 'you', check: all => {
+    expect(all.includes('hrn is not installed')).toBe(true)
+    expect(all.includes('in time')).toBe(false)
+  } },
+  { name: 'hrn too slow', w: { hrn: () => ({ deny: 'timed out after 180000 ms' }) }, view: 'you', check: all => {
+    expect(all.includes('hrn did not answer in time')).toBe(true)
+    expect(all.includes('not installed')).toBe(false)
+  } },
   { name: 'no request yet', w: {}, view: 'agent', check: all => {
     expect(all.includes('Waiting for a prompt.')).toBe(true)
     expect(all.includes('No request yet')).toBe(true)
@@ -661,6 +675,7 @@ test('stats from hrn are kept and drawn in the you view, and Refresh asks again'
     expect(all.includes('4,240 XP, 760 to level 10')).toBe(true)
     expect(all.includes('days streak, 2 of 35 days')).toBe(true)
     expect(all.includes('★ Budget keeper')).toBe(true)
+    expect(all.includes('Ada: level 2, 30 XP this week')).toBe(true)
     expect(all.includes('Waiting')).toBe(true)
     if (surface === 'terminal') {
       expect(all.includes('20%')).toBe(true)
@@ -876,6 +891,7 @@ test('hrn’s per-repository answers are read with care', () => {
     .toEqual([{ id: 'x', backend: 'unknown', status: 'ok', started: Date.parse('2026-11-20T10:00:00Z'), ms: 0 }])
   expect(kindLine('inside_ceiling', 41)).toBe('41 runs inside their ceiling')
   expect(kindLine('review_clean', 1)).toBe('1 clean review')
+  expect(kindLine('routed_failed', 2)).toBe('2 routed runs failed')
   expect(kindLine('something_new', 3)).toBe('3 something new')
   const strip35 = deliveryStrip([...Array(33).fill(0), 100, 445])
   expect((strip35.match(/<rect /g) ?? []).length).toBe(35)
@@ -1874,6 +1890,80 @@ test('a branch read in a repository is not shown once the session stands outside
 })
 
 // ---- Privacy ----
+
+test('an answer cut short is not read as stats', async ($, on) => {
+  const cut = { value: { ...ran(JSON.stringify(wire)).value, isStdoutTruncated: true } }
+  const w = world(on, { now: 910_000_000, repo: null, store: { view: 'you' }, hrn: () => cut })
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(w.store.has('stats')).toBe(false)
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect((await texts(ui)).includes('hrn did not answer')).toBe(true)
+  await ui.unmount()
+})
+
+test('while hrn is asked again the kept stats show their age, and a second reading is not started', async ($, on) => {
+  const now = 920_000_000
+  let clock: { sleep: (ms: number) => Promise<void> } | null = null
+  const w = world(on, {
+    now, repo: null, stamp: String(now),
+    store: { view: 'you', stats: { at: now - 5 * 60000, stats: parseStats(JSON.stringify(wire)).stats } },
+    hrn: async () => { await clock?.sleep(60000); return ran(JSON.stringify({ ...wire, level: 10 })) },
+  })
+  clock = w.clock
+  const asked = () => w.runs.filter(r => r.argv[0] === 'hrn').length
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(asked()).toBe(1)
+  const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
+  const all = await texts(ui)
+  expect(all.includes('Level 9')).toBe(true)
+  expect(all.includes('Asking… read 5 min ago')).toBe(true)
+  await ui.press({ key: 'refresh' })
+  await $.command.run(slash('ada'))
+  await w.clock.settle()
+  expect(asked()).toBe(1)
+  await w.clock.advance(61000)
+  const after = await texts(ui)
+  expect(after.includes('Level 10')).toBe(true)
+  expect(after.includes('Asking')).toBe(false)
+  await ui.unmount()
+})
+
+test('a reading marked as running by a build since replaced does not hold back a new one', async ($, on) => {
+  const w = world(on, { now: 930_000_000, repo: null, hrn: () => ran(JSON.stringify(wire)) })
+  const value = { stats: null, statsAt: 0, statsNote: '', refreshing: true, view: 'you', turnStartedAt: 0, runs: null, calls: [] }
+  on('state.get', () => ({ value: { value: { shape: 'ada-5', value }, version: 1 } }))
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await w.clock.settle()
+  expect(w.runs.some(r => r.argv.join(' ') === 'hrn bot stats --json')).toBe(true)
+})
+
+for (const [name, answer] of [['fails', ran('', 1)], ['runs out of time', { deny: 'timed out' }]] as [string, Answer][]) {
+  test(`a rebuild that ${name} is tried again after 15 minutes`, async ($, on) => {
+    const w = world(on, { now: name === 'fails' ? 940_000_000 : 950_000_000, repo: null, hrn: argv => (isRebuild(argv) ? answer : ran(JSON.stringify(wire))) })
+    const rebuilds = () => w.runs.filter(r => isRebuild(r.argv)).length
+    await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+    await w.clock.settle()
+    expect(rebuilds()).toBe(1)
+    await w.clock.advance(16 * 60000)
+    await $.turn.complete(turnDone(1000))
+    await w.clock.settle()
+    expect(rebuilds()).toBe(2)
+  })
+}
+
+test('state kept by the build before the redesign, which carried no shape, is reset', async ($, on) => {
+  world(on, { now: 960_000_000, repo: null })
+  on('state.get', () => ({ value: { value: { stats: 'Level 3, 120 xp', prompts: 4, started: 2, finished: 2, lastTool: 'Bash', lastStatus: 'ok' }, version: 1 } }))
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...pane, surface })
+    const all = await texts(ui)
+    expect(all.includes('Level 3, 120 xp')).toBe(false)
+    expect(all.includes('No tool calls yet')).toBe(true)
+    await ui.unmount()
+  }
+})
 
 test('nothing new reaches the recording file', async ($, on) => {
   const w = world(on, {

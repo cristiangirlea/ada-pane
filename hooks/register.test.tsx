@@ -184,67 +184,22 @@ test('a refresh already running is not started twice', async ($, on) => {
   expect(calls).toBe(1)
 })
 
-// The module keeps its rebuild time between tests, so each starts its clock later than the last.
-async function startSession($: any, on: any, now: number, files: Map<string, string>, rebuildExit = 0) {
-  const clock = mock.clock(on, { now })
+test('session start and the minute timer run only the JSON form and write nothing', async ($, on) => {
+  const clock = mock.clock(on, { now: 1e9 })
   mock.env(on, { HRN_HOME: '/hrn' })
   on('session.start', (_: unknown, e: { cwd: string }) => ({ cwd: e.cwd }))
-  const key = (path: string) => path.replace(/\\/g, '/').replace(/^.*?(\/hrn\/)/, '$1')
-  on('fs.exists', (_: unknown, e: { path: string }) => ({ value: files.has(key(e.path)) }))
-  on('fs.read', (_: unknown, e: { path: string }) => {
-    if (files.get(key(e.path)) === 'unreadable') throw new Error('permission denied')
-    return { value: files.get(key(e.path)) ?? '' }
-  })
-  on('fs.write', (_: unknown, e: { path: string; text: string }) => { files.set(key(e.path), e.text); return { value: undefined } })
+  let writes = 0
+  on('fs.write', () => { writes++; return { value: undefined } })
   const argv: string[] = []
   on('process.run', (_: unknown, e: { argv: readonly string[]; init?: { timeoutMs?: number } }) => {
     argv.push(`${e.argv.join(' ')} ${e.init?.timeoutMs}`)
-    if (e.argv.includes('--json')) return ran(0, sample)
-    if (rebuildExit < 0) throw new Error('timed out')
-    return ran(rebuildExit, 'text')
+    return ran(0, sample)
   })
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
   await clock.settle()
-  return { clock, argv, rebuilds: () => argv.filter(a => a === 'hrn bot stats 120000').length }
-}
-const stamp = '/hrn/claude-sessions/.ledger-rebuild'
-
-test('session start rebuilds the ledger in the background, then redraws from the JSON', async ($, on) => {
-  const files = new Map<string, string>()
-  const { clock, argv, rebuilds } = await startSession($, on, 1e9, files)
-  expect(rebuilds()).toBe(1)
-  expect(argv.at(-1)).toBe('hrn bot stats --json 30000')
-  expect(files.get(stamp)).toBe(String(1e9))
-  await clock.advance(60000)
-  expect(rebuilds()).toBe(1)
-  await clock.advance(15 * 60000)
-  expect(rebuilds()).toBe(2)
-  expect(argv.at(-1)).toBe('hrn bot stats --json 30000')
+  expect(argv).toEqual(['hrn bot stats --json 30000'])
+  await clock.advance(16 * 60000)
+  expect(argv.length).toBeGreaterThanOrEqual(16)
+  expect(argv.every(a => a === 'hrn bot stats --json 30000')).toBe(true)
+  expect(writes).toBe(0)
 })
-
-test('a recent rebuild by another session is not repeated', async ($, on) => {
-  const files = new Map([[stamp, String(2e9 - 5 * 60000)]])
-  const { clock, rebuilds } = await startSession($, on, 2e9, files)
-  expect(rebuilds()).toBe(0)
-  await clock.advance(5 * 60000)
-  expect(rebuilds()).toBe(0)
-  await clock.advance(6 * 60000)
-  expect(rebuilds()).toBe(1)
-})
-
-test('an unreadable stamp does not stop rebuilds', async ($, on) => {
-  const files = new Map([[stamp, 'unreadable']])
-  const { rebuilds } = await startSession($, on, 2.5e9, files)
-  expect(rebuilds()).toBe(1)
-  expect(files.get(stamp)).toBe(String(2.5e9))
-})
-
-for (const [name, exit, now] of [['fails', 1, 3e9], ['times out', -1, 4e9]] as const) {
-  test(`a rebuild that ${name} still redraws and is tried again later`, async ($, on) => {
-    const { clock, argv, rebuilds } = await startSession($, on, now, new Map(), exit)
-    expect(rebuilds()).toBe(1)
-    expect(argv.at(-1)).toBe('hrn bot stats --json 30000')
-    await clock.advance(16 * 60000)
-    expect(rebuilds()).toBe(2)
-  })
-}

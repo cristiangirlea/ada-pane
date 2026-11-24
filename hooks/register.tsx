@@ -28,7 +28,7 @@ function weekStart(value: unknown): string | undefined {
   return `${days[date.getUTCDay()]} ${date.getUTCDate()} ${months[date.getUTCMonth()]} ${date.getUTCFullYear()}`
 }
 
-// The JSON form skips the ledger rebuild that makes the text form too slow for a pane.
+// The JSON form folds new runs in and skips the text form's slow practice step.
 export function formatStats(stdout: string): string | undefined {
   let s: any
   try { s = JSON.parse(stdout) } catch { return undefined }
@@ -48,33 +48,11 @@ export function formatStats(stdout: string): string | undefined {
   return lines.join('\n')
 }
 
-let lastRebuild = -Infinity
-let rebuilding = false
-
 async function hrnHome($: EngineInterface) {
   const home = await $.env.get('HRN_HOME') || ((await $.env.get('HOME') || await $.env.get('USERPROFILE')) + '/.hrn')
   if (!home || home.startsWith('undefined/')) throw new Error('Home unavailable')
   return home.replace(/[\\/]+$/, '')
 }
-
-// Only the text form folds new runs into the ledger; run it now and then so the JSON stays current.
-// A stamp in the hrn home keeps it to one rebuild per computer, however many sessions are open.
-async function rebuild($: EngineInterface) {
-    try {
-      const now = await $.clock.now()
-      if (rebuilding || now - lastRebuild < 15 * 60000) return
-      const stamp = `${await hrnHome($)}/claude-sessions/.ledger-rebuild`
-      let last = NaN
-      try { if (await $.fs.exists(stamp)) last = Number(await $.fs.read(stamp)) } catch { /* An unreadable stamp must not stop rebuilds. */ }
-      if (Number.isFinite(last) && last <= now && now - last < 15 * 60000) { lastRebuild = last; return }
-      rebuilding = true
-      lastRebuild = now
-      try { await $.fs.write(stamp, String(now)) } catch { /* Without a stamp this session still rebuilds on its own schedule. */ }
-      try { await $.process.run(['hrn', 'bot', 'stats'], { timeoutMs: 120000 }) } catch { /* The next rebuild tries again. */ }
-      rebuilding = false
-      void refresh($, true)
-    } catch { rebuilding = false }
-  }
 
 async function refresh($: EngineInterface, force = false) {
     try {
@@ -128,8 +106,7 @@ export const register: Register = on => {
     try { await $.command.register({ name: 'ada', description: 'Open Ada’s session pane' }) } catch {}
     try { void $.ui.open({ id: 'ada', title: 'Ada' }).catch(() => {}) } catch {}
     void refresh($)
-    void rebuild($)
-    try { $.clock.every(60000, () => { void refresh($); void rebuild($) }) } catch {}
+    try { $.clock.every(60000, () => { void refresh($) }) } catch {}
     return result
   })
   on('command.run', { command: 'ada' }, async ($) => {

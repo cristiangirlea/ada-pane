@@ -28,7 +28,8 @@ claude plugin test .
 ```
 
 The repository has no CI workflow and no runner: these two are all that checks a change, and a
-PR says so. Never add a GitHub-hosted runner; this is a private repository.
+PR says so. The repository is public: a workflow, when one is added, runs on GitHub's runners,
+never on a self-hosted one.
 
 **Type-check.** The engine writes `.claude-plugin/types/` (its API, and the `tsconfig.json` ours
 extends) into a folder once it has loaded the mod from there; git ignores it, so a fresh clone or
@@ -63,7 +64,8 @@ that has the folder, copied from a checkout the engine has loaded:
   `docs/pane-design.md`; what a person sees or installs updates README.
 - Comments say why, in one line; no issue numbers, dates or history in code. Never name other
   products in code, docs, commits, PRs or issues.
-- A version bump, a tag or a release is a maintainer's step; so are a LICENSE and an icon.
+- A version bump, a tag or a release is a maintainer's step; so are the licence (MIT, `LICENSE`)
+  and an icon.
 
 ## Working rules
 

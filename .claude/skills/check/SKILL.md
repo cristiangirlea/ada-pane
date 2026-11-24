@@ -10,10 +10,10 @@ claude plugin validate .
 claude plugin test .
 ```
 
-- `validate` passes on exit 0. Four notes are known and left alone: no marketplace description,
+- `validate` passes on exit 0. Three notes are known and left alone: no marketplace description,
   `CLAUDE.md` at the root (it is for work on this repository, not context the mod ships), and
-  the plugin directory's notes on a missing LICENSE and a missing icon, which are a
-  maintainer's choices. Any other warning comes from the change: fix it.
+  the plugin directory's note on a missing icon, which is a maintainer's choice. Any other
+  warning comes from the change: fix it.
 - `test` runs every `*.test.ts` and `*.test.tsx` under the folder and exits 1 when a test fails. Report the
   pass and fail counts from its last lines.
 

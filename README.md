@@ -1,17 +1,25 @@
 # ada-pane
 
-Ada's side pane for Claude Code. It opens at session start and on `/ada`, shows
-`hrn bot stats --json` (refreshed every minute), counts prompts and tool calls, and reacts to
-each one.
+Ada's side pane for Claude Code. It opens at session start and on `/ada`, with four views:
+Session (context, plan limit, turn time, a strip of tool calls, the working tree and one
+suggested action), Agent (how a turn runs: the loop between the model and the tools drawn live,
+each model request of the turn, what the model read from the cache, what fills the context,
+helpers, and tasks handed to hrn; it works without hrn), Repo (the branch, its pull request and
+checks through `gh`, links, and, with
+an hrn that answers per repository, what was delivered here, its hrn runs and the week's top
+repositories) and You (`hrn bot stats`). In the terminal, the Repo view also links to a running
+`hrn watch`, at the address in the mod's `watch_address` option (default `127.0.0.1:8089`).
+The layout is specified in [docs/pane-design.md](docs/pane-design.md).
 
 The JSON form reads the game ledger without folding new runs in, so the pane also runs the slower
-`hrn bot stats` in the background, at most once every 15 minutes per computer, which can take a
-minute and calls GitHub through `gh`. The stamp `claude-sessions/.ledger-rebuild` in the hrn
-home keeps open sessions from repeating it.
+`hrn bot stats` in the background when a session starts and when a turn ends, at most once every
+15 minutes per computer, which can take a minute and calls GitHub through `gh`. The stamp
+`claude-sessions/.ledger-rebuild` in the hrn home keeps open sessions from repeating it.
 
 It records event metadata only (time, session, kind, tool name, ok or error; never prompt or
 command text) to `~/.hrn/claude-sessions/<session>.jsonl` (or under `HRN_HOME`), rotating files
-at 1 MiB.
+at 1 MiB. What the Agent view shows stays in the session and is written nowhere: tool names,
+counts and token figures, never a prompt, an answer or a tool's arguments.
 
 ## Install
 

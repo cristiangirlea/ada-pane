@@ -72,8 +72,6 @@ type World = {
   store?: Record<string, unknown>
   /** Whether the pane is the one its surface shows (true when not given). */
   shown?: boolean
-  /** An earlier session's rebuild stamp: its text, 'unreadable' for one that cannot be read, 'unwritable' for none that can be kept. */
-  stamp?: string
   /** The surfaces the session draws on (only the terminal when not given). */
   surfaces?: ('terminal' | 'desktop' | 'vscode' | 'mobile')[]
   /** What the watch address answers; unset refuses the connection. */
@@ -122,17 +120,9 @@ function world(on: On, w: World = {}) {
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'end_turn' as const, usage: null, ...w.step?.(e.index, e.agentId) }
   })
   on('session.repo', () => ({ value: w.repo === undefined ? REPO : w.repo }))
-  const isStamp = (path: string) => path.replace(/\\/g, '/').endsWith('/claude-sessions/.ledger-rebuild')
-  on('fs.exists', (_, e) => ({ value: files.has(e.path) || (isStamp(e.path) && w.stamp !== undefined) }))
-  on('fs.read', (_, e) => {
-    if (isStamp(e.path) && w.stamp === 'unreadable' && !files.has(e.path)) return { deny: 'unreadable' }
-    return { value: files.get(e.path) ?? (isStamp(e.path) ? w.stamp ?? '' : '') }
-  })
-  on('fs.write', (_, e) => {
-    if (isStamp(e.path) && w.stamp === 'unwritable') return { deny: 'read-only' }
-    files.set(e.path, e.text)
-    return { value: undefined }
-  })
+  on('fs.exists', (_, e) => ({ value: files.has(e.path) }))
+  on('fs.read', (_, e) => ({ value: files.get(e.path) ?? '' }))
+  on('fs.write', (_, e) => { files.set(e.path, e.text); return { value: undefined } })
   on('process.run', (_, e) => {
     runs.push({ argv: [...e.argv], cwd: e.init?.cwd, timeoutMs: e.init?.timeoutMs })
     if (e.argv[0] === 'git') return w.git ? w.git() : ran(GIT_CLEAN)
@@ -903,9 +893,10 @@ test('stats are asked per repository, with a short limit, where the session has 
   await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
   await w.clock.settle()
   const stats = w.runs.filter(r => r.argv[1] === 'bot' && r.argv.includes('--json'))
-  // One reading at start and one after the ledger rebuild, both per repository.
-  expect(stats.length).toBe(2)
+  expect(stats.length).toBe(1)
   for (const run of stats) expect(run).toEqual({ argv: ['hrn', 'bot', 'stats', '--json', '--repo', REPO_NAME], cwd: undefined, timeoutMs: 8000 })
+  // With a repository too, hrn is only ever asked for JSON.
+  for (const run of w.runs.filter(r => r.argv[0] === 'hrn')) expect(run.argv.includes('--json')).toBe(true)
   expect((w.store.get('stats') as { delivery: { week: number } }).delivery.week).toBe(545)
 })
 
@@ -1039,9 +1030,8 @@ test('the 2-minute stats reading runs only while the repo view is on screen', as
   const stats = () => w.runs.filter(r => r.argv[1] === 'bot' && r.argv.includes('--json')).length
   await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
   await w.clock.settle()
-  // What start reads (once, and once after the ledger rebuild) is the baseline.
   const atStart = stats()
-  expect(atStart).toBe(2)
+  expect(atStart).toBe(1)
   // Session view: turn ends 3 and 6 minutes on ask nothing (the full reading waits 10 minutes).
   for (const at of [180000, 180000]) {
     await w.clock.advance(at)
@@ -1103,9 +1093,9 @@ test('an old hrn in the repo view never runs the slow full reading on every turn
   const full = () => w.runs.filter(r => r.argv[1] === 'bot' && r.argv.includes('--json') && !r.argv.includes('--repo')).length
   await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
   await w.clock.settle()
-  // Start reads the old way once, and once more after the ledger rebuild; turns after that add none.
+  // Start reads the old way once; turns after that add none.
   const atStart = full()
-  expect(atStart).toBe(2)
+  expect(atStart).toBe(1)
   for (const step of [180000, 180000]) {
     await w.clock.advance(step)
     await $.turn.complete(turnDone(1000))
@@ -1119,15 +1109,15 @@ test('a per-repository reading that runs out of time falls back to the full one,
   const asked = () => w.runs.filter(r => r.argv[1] === 'bot' && r.argv.includes('--json')).map(r => r.argv.includes('--repo') ? r.timeoutMs : 'full')
   await $.session.start({ cwd: '/work/ada-pane', surface: 'desktop', isInteractive: true })
   await w.clock.settle()
-  // The reading after the ledger rebuild comes within the hour, so it goes the old way too.
-  expect(asked()).toEqual([8000, 'full', 'full'])
+  expect(asked()).toEqual([8000, 'full'])
   const ui = await $.ui.mount({ ...pane, surface: 'desktop' })
   const all = await texts(ui)
   expect(all.includes('Delivered here')).toBe(false)
   await ui.press({ key: 'view-you' })
   expect((await texts(ui)).includes('Level 9')).toBe(true)
   await ui.press({ key: 'refresh' })
-  expect(asked()).toEqual([8000, 'full', 'full', 'full'])
+  // A reading within the hour goes the old way too.
+  expect(asked()).toEqual([8000, 'full', 'full'])
   await ui.unmount()
 })
 
@@ -1327,68 +1317,20 @@ test('the watch is asked only while the repo view is on screen, at most once in 
   await ui.unmount()
 })
 
-// ---- Ledger rebuild ----
+// ---- No ledger rebuild ----
 
-const STAMP = '/hrn/claude-sessions/.ledger-rebuild'
-const isRebuild = (argv: string[]) => argv.length === 3 && argv[1] === 'bot' && argv[2] === 'stats'
-
-test('the ledger is rebuilt when a session starts, then not again for 15 minutes, and the stats are read again after it', async ($, on) => {
+test('only the JSON form of the stats is ever run, at a session’s start, at a turn’s end and while idle', async ($, on) => {
   const w = world(on, { now: 700_000_000, repo: null, hrn: () => ran(JSON.stringify(wire)) })
-  const rebuilds = () => w.runs.filter(r => isRebuild(r.argv))
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   await w.clock.settle()
-  expect(rebuilds().map(r => r.timeoutMs)).toEqual([120000])
-  const stamp = [...w.files.entries()].find(([path]) => path.replace(/\\/g, '/').endsWith(STAMP))
-  expect(stamp?.[1]).toBe('700000000')
-  // The reading after the rebuild is forced, so it comes though one was made a moment before.
-  expect(w.runs.filter(r => r.argv.includes('--json')).length).toBe(2)
-  await w.clock.advance(10 * 60000)
+  await w.clock.advance(16 * 60000)
   await $.turn.complete(turnDone(1000))
-  await w.clock.settle()
-  expect(rebuilds().length).toBe(1)
-  await w.clock.advance(6 * 60000)
-  await $.turn.complete(turnDone(1000))
-  await w.clock.settle()
-  expect(rebuilds().length).toBe(2)
-})
-
-test('a recent rebuild by another session is not repeated', async ($, on) => {
-  const now = 710_000_000
-  const w = world(on, { now, repo: null, hrn: () => ran(JSON.stringify(wire)), stamp: String(now - 5 * 60000) })
-  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
-  await w.clock.settle()
-  expect(w.runs.filter(r => isRebuild(r.argv)).length).toBe(0)
-})
-
-test('an unreadable stamp does not stop rebuilds', async ($, on) => {
-  const w = world(on, { now: 720_000_000, repo: null, hrn: () => ran(JSON.stringify(wire)), stamp: 'unreadable' })
-  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
-  await w.clock.settle()
-  expect(w.runs.filter(r => isRebuild(r.argv)).length).toBe(1)
-})
-
-test('a session that cannot keep the stamp still rebuilds at most once in 15 minutes', async ($, on) => {
-  const w = world(on, { now: 725_000_000, repo: null, hrn: () => ran(JSON.stringify(wire)), stamp: 'unwritable' })
-  const rebuilds = () => w.runs.filter(r => isRebuild(r.argv)).length
-  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
-  await w.clock.settle()
-  expect(rebuilds()).toBe(1)
-  await w.clock.advance(5 * 60000)
-  await $.turn.complete(turnDone(1000))
-  await w.clock.settle()
-  expect(rebuilds()).toBe(1)
-  await w.clock.advance(11 * 60000)
-  await $.turn.complete(turnDone(1000))
-  await w.clock.settle()
-  expect(rebuilds()).toBe(2)
-})
-
-test('no timer rebuilds the ledger while the session is idle', async ($, on) => {
-  const w = world(on, { now: 730_000_000, repo: null, hrn: () => ran(JSON.stringify(wire)) })
-  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   await w.clock.settle()
   await w.clock.advance(60 * 60000)
-  expect(w.runs.filter(r => isRebuild(r.argv)).length).toBe(1)
+  const stats = w.runs.filter(r => r.argv[0] === 'hrn' && r.argv[1] === 'bot')
+  expect(stats.length).toBe(2)
+  for (const run of stats) expect(run.argv).toEqual(['hrn', 'bot', 'stats', '--json'])
+  expect(w.files.size).toBe(0)
 })
 
 test('every picture is drawn at the size its markup declares, so the strip stays a thin row', async ($, on) => {
@@ -1906,7 +1848,7 @@ test('while hrn is asked again the kept stats show their age, and a second readi
   const now = 920_000_000
   let clock: { sleep: (ms: number) => Promise<void> } | null = null
   const w = world(on, {
-    now, repo: null, stamp: String(now),
+    now, repo: null,
     store: { view: 'you', stats: { at: now - 5 * 60000, stats: parseStats(JSON.stringify(wire)).stats } },
     hrn: async () => { await clock?.sleep(60000); return ran(JSON.stringify({ ...wire, level: 10 })) },
   })
@@ -1938,20 +1880,6 @@ test('a reading marked as running by a build since replaced does not hold back a
   await w.clock.settle()
   expect(w.runs.some(r => r.argv.join(' ') === 'hrn bot stats --json')).toBe(true)
 })
-
-for (const [name, answer] of [['fails', ran('', 1)], ['runs out of time', { deny: 'timed out' }]] as [string, Answer][]) {
-  test(`a rebuild that ${name} is tried again after 15 minutes`, async ($, on) => {
-    const w = world(on, { now: name === 'fails' ? 940_000_000 : 950_000_000, repo: null, hrn: argv => (isRebuild(argv) ? answer : ran(JSON.stringify(wire))) })
-    const rebuilds = () => w.runs.filter(r => isRebuild(r.argv)).length
-    await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
-    await w.clock.settle()
-    expect(rebuilds()).toBe(1)
-    await w.clock.advance(16 * 60000)
-    await $.turn.complete(turnDone(1000))
-    await w.clock.settle()
-    expect(rebuilds()).toBe(2)
-  })
-}
 
 test('state kept by the build before the redesign, which carried no shape, is reset', async ($, on) => {
   world(on, { now: 960_000_000, repo: null })
@@ -1988,11 +1916,8 @@ test('nothing new reaches the recording file', async ($, on) => {
   await $.turn.complete(turnDone(4000))
   await w.clock.advance(20000)
   const written = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
-  // Beside the recording only the ledger rebuild's stamp is written, and it holds a time alone.
-  expect([...w.files.keys()].map(written).sort()).toEqual(['/hrn/claude-sessions/.ledger-rebuild', '/hrn/claude-sessions/session-1.jsonl'])
-  const stamp = [...w.files.entries()].find(([path]) => written(path).endsWith('.ledger-rebuild'))?.[1] ?? ''
-  expect(/^\d+$/.test(stamp)).toBe(true)
-  w.files.delete([...w.files.keys()].find(path => written(path).endsWith('.ledger-rebuild')) ?? '')
+  // The recording is the one file written.
+  expect([...w.files.keys()].map(written)).toEqual(['/hrn/claude-sessions/session-1.jsonl'])
   const rows = [...w.files.values()].join('').trim().split('\n').map(line => JSON.parse(line))
   expect(rows).toEqual([
     { time: new Date(250_000_000).toISOString(), session: 'session-1', kind: 'prompt' },

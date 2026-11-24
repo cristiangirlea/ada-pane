@@ -11,10 +11,10 @@ repositories) and You (`hrn bot stats`). In the terminal, the Repo view also lin
 `hrn watch`, at the address in the mod's `watch_address` option (default `127.0.0.1:8089`).
 The layout is specified in [docs/pane-design.md](docs/pane-design.md).
 
-The JSON form reads the game ledger without folding new runs in, so the pane also runs the slower
-`hrn bot stats` in the background when a session starts and when a turn ends, at most once every
-15 minutes per computer, which can take a minute and calls GitHub through `gh`. The stamp
-`claude-sessions/.ledger-rebuild` in the hrn home keeps open sessions from repeating it.
+The JSON form folds new runs into the game ledger before it answers, so the numbers stay current
+(hrn built from harness main at or after `8c26cd99`; an older hrn shows the ledger as last folded).
+One figure can lag: practice XP for a read whose pull request has since merged is credited when
+you run `hrn bot stats` in a terminal or answer the next exercise.
 
 It records event metadata only (time, session, kind, tool name, ok or error; never prompt or
 command text) to `~/.hrn/claude-sessions/<session>.jsonl` (or under `HRN_HOME`), rotating files
